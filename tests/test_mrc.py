@@ -7,8 +7,9 @@ import unittest
 from PIL import Image
 from pypdf.generic import ArrayObject, NameObject, NumberObject
 
-from pdfopt.mrc import (_eligible, _encode_stencil, _image_stream,
-                        encode_jpeg_trials)
+from pdfopt.mrc import (_eligible, _encode_stencil, _globals_stream,
+                        _image_stream, _jbig2_streams, _stencil_png,
+                        encode_jpeg_trials, encode_jpx_trials)
 
 
 def base_image(**overrides):
@@ -42,6 +43,27 @@ class ImageStreamTests(unittest.TestCase):
         self.assertEqual(params["/Columns"], 640)
         self.assertEqual(params["/Rows"], 480)
         self.assertTrue(params["/BlackIs1"])
+
+    def test_jbig2_stencil_carries_global_reference(self):
+        reference = NumberObject(7)
+        image = _image_stream(b"mask", 640, 480, stencil=True,
+                              jbig2_globals=reference)
+        self.assertEqual(image["/Filter"], "/JBIG2Decode")
+        self.assertTrue(image["/ImageMask"])
+        self.assertIs(image["/DecodeParms"]["/JBIG2Globals"], reference)
+
+    def test_jpx_background_stream(self):
+        image = _image_stream(b"codestream", 640, 480, stencil=False, jpx=True)
+        self.assertEqual(image["/Filter"], "/JPXDecode")
+        self.assertEqual(image["/ColorSpace"], "/DeviceRGB")
+        self.assertNotIn("/ImageMask", image)
+
+
+class GlobalsStreamTests(unittest.TestCase):
+    def test_keeps_raw_bytes_without_a_filter(self):
+        stream = _globals_stream(b"globals")
+        self.assertEqual(stream._data, b"globals")
+        self.assertNotIn("/Filter", stream)
 
 
 class EligibilityTests(unittest.TestCase):
@@ -95,6 +117,56 @@ class JpegTrialTests(unittest.TestCase):
             trials = encode_jpeg_trials(self._bitmap(), 75, Path(root))
         self.assertGreaterEqual(len(trials), 2)
         self.assertLessEqual(len(trials[0]), len(trials[-1]))
+
+
+class JpxTrialTests(unittest.TestCase):
+    @staticmethod
+    def _bitmap():
+        image = Image.new("RGB", (128, 96))
+        image.putdata([((x * 2) % 256, (y * 3) % 256, (x + y) % 256)
+                       for y in range(96) for x in range(128)])
+        return image
+
+    @unittest.skipUnless(shutil.which("opj_compress"), "opj_compress не установлен")
+    def test_returns_sorted_decodable_candidates(self):
+        with tempfile.TemporaryDirectory() as root:
+            trials = encode_jpx_trials(self._bitmap(), 75, Path(root))
+        self.assertGreaterEqual(len(trials), 1)
+        self.assertEqual(trials, sorted(trials, key=len))
+        for data in trials:
+            with Image.open(BytesIO(data)) as image:
+                self.assertEqual(image.size, (128, 96))
+
+
+class Jbig2Tests(unittest.TestCase):
+    @staticmethod
+    def _stencil(offset=0):
+        image = Image.new("1", (128, 128), 1)
+        for y in range(16 + offset, 64, 8):
+            for x in range(16, 112):
+                image.putpixel((x, y), 0)
+        return image
+
+    def test_stencil_png_roundtrips(self):
+        stencil = self._stencil()
+        with Image.open(BytesIO(_stencil_png(stencil))) as decoded:
+            self.assertEqual(decoded.size, stencil.size)
+
+    @unittest.skipUnless(shutil.which("jbig2"), "jbig2 не установлен")
+    def test_streams_cover_every_page(self):
+        stencils = [_stencil_png(self._stencil(0)), _stencil_png(self._stencil(3))]
+        with tempfile.TemporaryDirectory() as root:
+            result = _jbig2_streams(stencils, Path(root))
+        self.assertIsNotNone(result)
+        globals_bytes, pages = result
+        self.assertGreater(len(globals_bytes), 0)
+        self.assertEqual(len(pages), 2)
+        for page in pages:
+            self.assertGreater(len(page), 0)
+
+    def test_missing_inputs_returns_none(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(_jbig2_streams([], Path(root)))
 
 
 class StencilEncodingTests(unittest.TestCase):

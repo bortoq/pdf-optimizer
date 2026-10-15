@@ -13,9 +13,10 @@
 - **Lossy (JPEG)** — перекодирование встроенных JPEG (`/DCTDecode`) с контролем
   SSIM по отрисованным страницам; при наличии `cjpeg` дополнительно
   пробуется progressive-кодирование и берётся меньший прошедший поток.
-- **Lossy (MRC)** — слойное сжатие сканов: JPEG-фон уменьшенного разрешения,
-  полноразмерная бинарная маска (Flate или CCITT Group 4 — что меньше) и
-  одноцветные чернила. OCR-слой сохраняется.
+- **Lossy (MRC)** — слойное сжатие сканов: фон уменьшенного разрешения
+  (JPEG или JPEG 2000 — что меньше) и полноразмерная бинарная маска
+  (JBIG2 с общей таблицей символов, иначе Flate или CCITT Group 4 — что
+  меньше), плюс одноцветные чернила. OCR-слой сохраняется.
 - **Ghostscript** — дополнительные профили для PDF без текстового слоя.
 - **Hyper Compress** — внешний `hpdf-worker`, подключается автоматически или
   через `--pdf-worker` / переменные окружения `PDFOPT_HYPER_WORKER`,
@@ -61,7 +62,13 @@ python3 -m pdfopt --help
 - **Для lossy:** `ffmpeg` (SSIM), `pdftoppm` из poppler-utils (отрисовка),
   а также `gs` (Ghostscript) для PDF без текста.
 - **Опционально:** `jpegtran` и `cjpeg` из libjpeg-turbo/mozjpeg для более
-  плотного JPEG; собранный `hpdf-worker` из BentoPDF Hyper Compress.
+  плотного JPEG; `jbig2` (jbig2enc) для JBIG2-масок в MRC; `opj_compress`
+  (OpenJPEG) для JPEG 2000 фона в MRC; собранный `hpdf-worker` из BentoPDF
+  Hyper Compress.
+
+`jbig2` вызывается один раз на документ (`-s -p -b`), поэтому все страницы
+делят одну таблицу символов `/JBIG2Globals`; JBIG2 применяется только когда
+его суммарный размер меньше Flate/Group 4, иначе используется прежний путь.
 
 Пустой каталог `third_party/bentopdf-hyper-compress/cli/prebuilt/hpdf-worker`
 в корне репозитория распознаётся автоматически, если в него положить бинарник.
@@ -72,8 +79,8 @@ python3 -m pdfopt --help
 python3 -m unittest discover -s tests -v
 ```
 
-Тесты, которым нужны `ffmpeg`, `pdftoppm` или `gs`, пропускаются, если этих
-инструментов нет.
+Тесты, которым нужны `ffmpeg`, `pdftoppm`, `gs`, `cjpeg`, `jbig2` или
+`opj_compress`, пропускаются, если этих инструментов нет.
 
 ## Источник
 

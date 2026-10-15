@@ -57,22 +57,67 @@ def encode_jpeg_trials(bitmap: Image.Image, quality: int,
     return sorted(set(candidates), key=len)
 
 
+def encode_jpx_trials(bitmap: Image.Image, quality: int,
+                      scratch: Path) -> list[bytes]:
+    """Return raw JPEG 2000 codestream candidates, smallest first.
+
+    Uses ``opj_compress`` when available; JPEG 2000 often beats JPEG at the
+    same perceived quality for the smeared MRC background layer.
+    """
+    opj = shutil.which("opj_compress")
+    if opj is None:
+        return []
+    source = scratch / "jpx-input.ppm"
+    target = scratch / "jpx-output.j2k"
+    try:
+        bitmap.save(source)
+    except (OSError, ValueError):
+        return []
+    trials = []
+    for rate in (24, 30, 40):
+        target.unlink(missing_ok=True)
+        try:
+            completed = subprocess.run(
+                [opj, "-i", str(source), "-o", str(target), "-I", "-r", str(rate)],
+                capture_output=True, text=True, check=False,
+                timeout=JPEG_TIMEOUT, stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if completed.returncode == 0 and target.is_file():
+            trials.append(target.read_bytes())
+    return sorted(set(trials), key=len)
+
+
 def _image_stream(data: bytes, width: int, height: int, *, stencil: bool,
-                  group4: bool = False):
+                  group4: bool = False, jbig2_globals=None, jpx: bool = False):
     image = EncodedStreamObject()
     image._data = data
+    if jbig2_globals is not None:
+        filter_name = "/JBIG2Decode"
+    elif group4:
+        filter_name = "/CCITTFaxDecode"
+    elif stencil:
+        filter_name = "/FlateDecode"
+    elif jpx:
+        filter_name = "/JPXDecode"
+    else:
+        filter_name = "/DCTDecode"
     image.update({
         NameObject("/Type"): NameObject("/XObject"),
         NameObject("/Subtype"): NameObject("/Image"),
         NameObject("/Width"): NumberObject(width),
         NameObject("/Height"): NumberObject(height),
         NameObject("/BitsPerComponent"): NumberObject(1 if stencil else 8),
-        NameObject("/Filter"): NameObject("/CCITTFaxDecode" if group4 else
-                                        "/FlateDecode" if stencil else "/DCTDecode"),
+        NameObject("/Filter"): NameObject(filter_name),
     })
     if stencil:
         image[NameObject("/ImageMask")] = BooleanObject(True)
-        if group4:
+        if jbig2_globals is not None:
+            image[NameObject("/DecodeParms")] = DictionaryObject({
+                NameObject("/JBIG2Globals"): jbig2_globals,
+            })
+        elif group4:
             image[NameObject("/DecodeParms")] = DictionaryObject({
                 NameObject("/K"): NumberObject(-1),
                 NameObject("/Columns"): NumberObject(width),
@@ -82,6 +127,12 @@ def _image_stream(data: bytes, width: int, height: int, *, stencil: bool,
     else:
         image[NameObject("/ColorSpace")] = NameObject("/DeviceRGB")
     return image
+
+
+def _globals_stream(data: bytes):
+    stream = EncodedStreamObject()
+    stream._data = data
+    return stream
 
 
 def _encode_stencil(stencil: Image.Image) -> tuple[bytes, bool]:
@@ -101,6 +152,44 @@ def _encode_stencil(stencil: Image.Image) -> tuple[bytes, bool]:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return flate, False
+
+
+def _stencil_png(stencil: Image.Image) -> bytes:
+    output = BytesIO()
+    stencil.save(output, "PNG")
+    return output.getvalue()
+
+
+def _jbig2_streams(stencils: list[bytes], scratch: Path):
+    """Run jbig2enc over all stencils and return (globals, page streams)."""
+    jbig2 = shutil.which("jbig2")
+    if jbig2 is None or not stencils:
+        return None
+    paths = []
+    for index, data in enumerate(stencils):
+        path = scratch / f"mrc-stencil-{index:05d}.png"
+        path.write_bytes(data)
+        paths.append(path)
+    base = scratch / "mrc-jbig2"
+    try:
+        completed = subprocess.run(
+            [jbig2, "-s", "-p", "-b", str(base), *map(str, paths)],
+            capture_output=True, check=False, timeout=JPEG_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    globals_path = scratch / "mrc-jbig2.sym"
+    pages = sorted(scratch.glob("mrc-jbig2.[0-9]*"))
+    if not globals_path.is_file() or len(pages) != len(paths):
+        return None
+    try:
+        globals_bytes = globals_path.read_bytes()
+        return globals_bytes, [page.read_bytes() for page in pages]
+    except OSError:
+        return None
 
 
 def _eligible(image) -> bool:
@@ -132,6 +221,7 @@ def _layers(source_bytes: bytes, stored_size: int,
     color = tuple(int(v) for v in np.median(rgb[selected], axis=0))
     stencil = Image.fromarray((~selected * 255).astype(np.uint8), "L").convert("1")
     mask_bytes, group4 = _encode_stencil(stencil)
+    stencil_png = _stencil_png(stencil)
     selection = Image.fromarray((selected * 255).astype(np.uint8), "L")
 
     page_width = max(page_size[0], 1.0)
@@ -150,14 +240,22 @@ def _layers(source_bytes: bytes, stored_size: int,
         small_mask = selection.resize(size, Image.Resampling.BOX)
         small_mask = small_mask.filter(ImageFilter.MaxFilter(7))
         background.paste(background.filter(ImageFilter.MaxFilter(11)), mask=small_mask)
-        jpeg = encode_jpeg_trials(background, quality, scratch)[0]
-        if len(jpeg) + len(mask_bytes) + 600 >= stored_size:
-            continue
-        foreground = Image.open(BytesIO(jpeg)).resize(bitmap.size, Image.Resampling.BICUBIC)
-        foreground.paste(color, mask=selection.convert("1"))
-        foreground.resize(preview_size, Image.Resampling.LANCZOS).save(trial)
-        if compare(reference, trial) >= min(1.0, minimum + PREVIEW_MARGIN):
-            return jpeg, size, mask_bytes, (width, height), color, group4
+        trials = [("/DCTDecode", encode_jpeg_trials(background, quality, scratch)[0])]
+        trials += [("/JPXDecode", data)
+                   for data in encode_jpx_trials(background, quality, scratch)]
+        for codec, data in sorted(trials, key=lambda entry: len(entry[1])):
+            if len(data) + len(mask_bytes) + 600 >= stored_size:
+                continue
+            try:
+                decoded = Image.open(BytesIO(data)).convert("RGB")
+            except (OSError, ValueError):
+                continue
+            foreground = decoded.resize(bitmap.size, Image.Resampling.BICUBIC)
+            foreground.paste(color, mask=selection.convert("1"))
+            foreground.resize(preview_size, Image.Resampling.LANCZOS).save(trial)
+            if compare(reference, trial) >= min(1.0, minimum + PREVIEW_MARGIN):
+                return (data, size, mask_bytes, (width, height), color, group4,
+                        stencil_png, codec)
     return None
 
 
@@ -188,14 +286,19 @@ def add_layers(writer, scratch: Path, compare, minimum: float):
         (id(image.indirect_reference.pdf), image.indirect_reference.idnum)
         for image in images if image is not None and image.indirect_reference is not None
     )
-    def apply(number, image, result):
+    def apply(number, image, result, jbig2_data, globals_ref):
         if result is None:
             return
-        jpeg, bg_size, mask, mask_size, color, group4 = result
+        jpeg, bg_size, mask, mask_size, color, group4, _stencil, codec = result
         before = dict(image)
         before_data = image._data
-        background = writer._add_object(_image_stream(jpeg, *bg_size, stencil=False))
-        stencil = writer._add_object(_image_stream(mask, *mask_size, stencil=True,
+        background = writer._add_object(_image_stream(
+            jpeg, *bg_size, stencil=False, jpx=codec == "/JPXDecode"))
+        if jbig2_data is not None:
+            ink = writer._add_object(_image_stream(
+                jbig2_data, *mask_size, stencil=True, jbig2_globals=globals_ref))
+        else:
+            ink = writer._add_object(_image_stream(mask, *mask_size, stencil=True,
                                                    group4=group4))
         image.clear()
         image.update({
@@ -207,7 +310,7 @@ def add_layers(writer, scratch: Path, compare, minimum: float):
             NameObject("/Resources"): DictionaryObject({
                 NameObject("/XObject"): DictionaryObject({
                     NameObject("/Bg"): background,
-                    NameObject("/Ink"): stencil,
+                    NameObject("/Ink"): ink,
                 }),
             }),
         })
@@ -218,6 +321,15 @@ def add_layers(writer, scratch: Path, compare, minimum: float):
     workers = min(4, os.cpu_count() or 1) if total >= 16 else 1
     pool = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
     batch = []
+    pending = []
+
+    def drain(items):
+        jobs = [item[2] for item in items]
+        results = pool.map(_layer_job, jobs) if pool else map(_layer_job, jobs)
+        for item, result in zip(items, results):
+            if result is not None:
+                pending.append((item[0], item[1], result))
+
     try:
         for number, page in enumerate(writer.pages, start=1):
             if total >= 50 and number % 50 == 0:
@@ -236,19 +348,28 @@ def add_layers(writer, scratch: Path, compare, minimum: float):
                    scratch, compare, minimum)
             batch.append((number, image, job))
             if len(batch) == workers:
-                jobs = [item[2] for item in batch]
-                results = pool.map(_layer_job, jobs) if pool else map(_layer_job, jobs)
-                for item, result in zip(batch, results):
-                    apply(item[0], item[1], result)
+                drain(batch)
                 batch.clear()
         if batch:
-            jobs = [item[2] for item in batch]
-            results = pool.map(_layer_job, jobs) if pool else map(_layer_job, jobs)
-            for item, result in zip(batch, results):
-                apply(item[0], item[1], result)
+            drain(batch)
     finally:
         if pool:
             pool.shutdown(cancel_futures=True)
+
+    jbig2 = _jbig2_streams([item[2][6] for item in pending], scratch)
+    jbig2_pages = None
+    globals_ref = None
+    if jbig2 is not None:
+        globals_bytes, page_streams = jbig2
+        mask_total = sum(len(item[2][2]) for item in pending)
+        jbig2_total = len(globals_bytes) + sum(len(page) for page in page_streams)
+        if jbig2_total < mask_total:
+            globals_ref = writer._add_object(_globals_stream(globals_bytes))
+            jbig2_pages = page_streams
+    for index, (number, image, result) in enumerate(pending):
+        apply(number, image, result,
+              jbig2_pages[index] if jbig2_pages is not None else None,
+              globals_ref)
     return records
 
 

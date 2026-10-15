@@ -439,8 +439,12 @@ def _make_mrc_candidate(source: Path, target: Path, scratch: Path,
         if not passed:
             raise ValueError(f"ни одна страница MRC не прошла SSIM ≥ {min_ssim:.2f}")
         if rejected:
-            writer.compress_identical_objects(remove_duplicates=False,
-                                              remove_unreferenced=True)
+            try:
+                writer.compress_identical_objects(remove_duplicates=False,
+                                                  remove_unreferenced=True)
+            except NotImplementedError:
+                # pypdf cannot hash JBIG2/JPX streams; keep them instead.
+                pass
             with target.open("wb") as output:
                 writer.write(output)
         if len(writer.pages) >= 50:
