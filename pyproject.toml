@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdfopt"
+version = "0.1.0"
+description = "Standalone PDF optimizer: lossless recompression, JPEG and layered MRC"
+requires-python = ">=3.11"
+dependencies = ["pypdf>=6,<7", "Pillow>=10,<13", "numpy>=1.26,<3"]
+
+[project.scripts]
+pdfopt = "pdfopt.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pdfopt*"]
