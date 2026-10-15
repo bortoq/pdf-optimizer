@@ -1,8 +1,14 @@
-from PIL import Image
-from pypdf.generic import ArrayObject, NameObject, NumberObject
+from pathlib import Path
+from io import BytesIO
+import shutil
+import tempfile
 import unittest
 
-from pdfopt.mrc import _eligible, _encode_stencil, _image_stream
+from PIL import Image
+from pypdf.generic import ArrayObject, NameObject, NumberObject
+
+from pdfopt.mrc import (_eligible, _encode_stencil, _image_stream,
+                        encode_jpeg_trials)
 
 
 def base_image(**overrides):
@@ -64,6 +70,31 @@ class EligibilityTests(unittest.TestCase):
         for key in ("Mask", "SMask", "Decode", "DecodeParms"):
             self.assertFalse(_eligible(base_image(**{key: NameObject("/X")})),
                              f"{key} должен исключать изображение")
+
+
+class JpegTrialTests(unittest.TestCase):
+    @staticmethod
+    def _bitmap():
+        image = Image.new("RGB", (64, 64))
+        image.putdata([((x * 4) % 256, (y * 4) % 256, (x + y) % 256)
+                       for y in range(64) for x in range(64)])
+        return image
+
+    def test_returns_sorted_decodable_candidates(self):
+        with tempfile.TemporaryDirectory() as root:
+            trials = encode_jpeg_trials(self._bitmap(), 75, Path(root))
+        self.assertGreaterEqual(len(trials), 1)
+        self.assertEqual(trials, sorted(trials, key=len))
+        for data in trials:
+            with Image.open(BytesIO(data)) as image:
+                self.assertEqual(image.size, (64, 64))
+
+    @unittest.skipUnless(shutil.which("cjpeg"), "cjpeg не установлен")
+    def test_cjpeg_adds_a_candidate_not_larger_than_pillow(self):
+        with tempfile.TemporaryDirectory() as root:
+            trials = encode_jpeg_trials(self._bitmap(), 75, Path(root))
+        self.assertGreaterEqual(len(trials), 2)
+        self.assertLessEqual(len(trials[0]), len(trials[-1]))
 
 
 class StencilEncodingTests(unittest.TestCase):

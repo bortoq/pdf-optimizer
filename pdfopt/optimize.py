@@ -17,7 +17,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import NameObject
 from PIL import Image
 
-from .mrc import add_layers, restore
+from .mrc import add_layers, encode_jpeg_trials, restore
 
 
 HYPER_TOKENS = {
@@ -33,6 +33,8 @@ SSIM_DPI = 200
 # Ghostscript's QFactor grows as JPEG compression becomes stronger.
 GHOSTSCRIPT_PROFILES = ((300, 0.35), (240, 0.50), (200, 0.65))
 JPEG_QUALITIES = (35, 45, 60, 75, 90)
+# jpegtran is lossless: it only rewrites the entropy coding, never the pixels.
+JPEGTRAN_PROFILES = (("-optimize",), ("-optimize", "-progressive"))
 
 
 def _has_signature(path: Path, reader: PdfReader) -> bool:
@@ -115,7 +117,7 @@ def _make_pypdf_candidate(source: Path, target: Path) -> None:
         for page in writer.pages:
             page.compress_content_streams(level=9)
         writer.compress_identical_objects(remove_duplicates=True,
-                                          remove_unreferenced=False)
+                                          remove_unreferenced=True)
         with target.open("wb") as output:
             writer.write(output)
 
@@ -175,24 +177,121 @@ def _make_jpeg_candidate(source: Path, target: Path, scratch: Path,
                     with Image.open(BytesIO(source_bytes)) as bitmap:
                         if bitmap.mode not in ("RGB", "L"):
                             continue
+                        accepted = None
                         for quality in JPEG_QUALITIES:
-                            buffer = BytesIO()
-                            bitmap.save(buffer, "JPEG", quality=quality, optimize=True)
-                            encoded = buffer.getvalue()
-                            if len(encoded) >= len(source_bytes):
-                                continue
-                            trial_image.write_bytes(encoded)
-                            if _page_ssim(original_image, trial_image) >= min_ssim:
-                                obj._data = encoded
-                                obj[NameObject("/Filter")] = NameObject("/DCTDecode")
-                                changed += 1
+                            for encoded in encode_jpeg_trials(bitmap, quality, scratch):
+                                if len(encoded) >= len(source_bytes):
+                                    continue
+                                trial_image.write_bytes(encoded)
+                                if _page_ssim(original_image, trial_image) >= min_ssim:
+                                    accepted = encoded
+                                    break
+                            if accepted is not None:
                                 break
+                        if accepted is not None:
+                            obj._data = accepted
+                            obj[NameObject("/Filter")] = NameObject("/DCTDecode")
+                            changed += 1
                 except (OSError, ValueError):
                     continue
         if not changed:
             raise ValueError(f"не найдено JPEG-изображений при SSIM ≥ {min_ssim:.2f}")
         with target.open("wb") as output:
             writer.write(output)
+
+
+def _same_pixels(first: bytes, second: bytes) -> bool:
+    """True when two JPEG streams decode to identical pixels and mode."""
+    try:
+        with Image.open(BytesIO(first)) as a, Image.open(BytesIO(second)) as b:
+            return (a.mode == b.mode and a.size == b.size and
+                    a.tobytes() == b.tobytes())
+    except (OSError, ValueError):
+        return False
+
+
+def _jpegtran_encode(data: bytes, scratch: Path,
+                     jpegtran: str) -> bytes | None:
+    """Losslessly shrink one JPEG stream, keeping the smallest profile."""
+    source = scratch / "jpegtran-in.jpg"
+    target = scratch / "jpegtran-out.jpg"
+    source.write_bytes(data)
+    best = None
+    for profile in JPEGTRAN_PROFILES:
+        target.unlink(missing_ok=True)
+        completed = subprocess.run(
+            [jpegtran, "-copy", "none", *profile,
+             "-outfile", str(target), str(source)],
+            capture_output=True, text=True, check=False, timeout=TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+        if completed.returncode != 0 or not target.is_file():
+            continue
+        encoded = target.read_bytes()
+        if len(encoded) < len(data) and (best is None or len(encoded) < len(best)):
+            best = encoded
+    return best
+
+
+def _jpeg_eligible(obj) -> bool:
+    """Whether a DCTDecode stream can be rewritten by jpegtran.
+
+    Only the entropy coding changes, so masks and /Decode stay valid. Images
+    carrying /DecodeParms are skipped because the color transform may depend
+    on JPEG markers that ``-copy none`` removes.
+    """
+    filters = obj.get("/Filter")
+    if (filters != "/DCTDecode" and
+            list(filters or []) != ["/FlateDecode", "/DCTDecode"]):
+        return False
+    return obj.get("/BitsPerComponent") == 8 and "/DecodeParms" not in obj
+
+
+def _make_jpegtran_candidate(source: Path, target: Path, scratch: Path) -> None:
+    """Rewrite DCTDecode streams with optimized Huffman/progressive scans.
+
+    This is pixel-for-pixel lossless, so it is safe in the lossless mode too.
+    """
+    jpegtran = shutil.which("jpegtran")
+    if jpegtran is None:
+        raise ValueError("jpegtran не найден")
+    changed = 0
+    visited = set()
+    with source.open("rb") as stream:
+        writer = PdfWriter(clone_from=PdfReader(stream, strict=True))
+        for page in writer.pages:
+            for obj in _image_objects(page):
+                reference = obj.indirect_reference
+                key = (id(reference.pdf), reference.idnum) if reference else id(obj)
+                if key in visited:
+                    continue
+                visited.add(key)
+                if not _jpeg_eligible(obj):
+                    continue
+                data = obj.get_data()
+                encoded = _jpegtran_encode(data, scratch, jpegtran)
+                if encoded is None or not _same_pixels(data, encoded):
+                    continue
+                obj._data = encoded
+                obj[NameObject("/Filter")] = NameObject("/DCTDecode")
+                changed += 1
+        if not changed:
+            raise ValueError("jpegtran: нет JPEG-изображений для уменьшения")
+        with target.open("wb") as output:
+            writer.write(output)
+
+
+def _make_lossless_pipeline(source: Path, target: Path, scratch: Path) -> None:
+    """Stack the pypdf structural pass with lossless JPEG rewriting."""
+    stage = scratch / "lossless-stage.pdf"
+    _make_pypdf_candidate(source, stage)
+    if shutil.which("jpegtran"):
+        try:
+            _make_jpegtran_candidate(stage, target, scratch)
+            return
+        except ValueError:
+            pass
+    os.replace(stage, target)
 
 
 def _make_hyper_candidate(worker: Path, source: Path, target: Path,
@@ -373,6 +472,11 @@ def optimize_pdf(path: Path, mode: str, dry_run: bool,
     with tempfile.TemporaryDirectory(prefix=".pdfopt-", dir=path.parent) as directory:
         scratch = Path(directory)
         engines = [("pypdf", _make_pypdf_candidate)]
+        if shutil.which("jpegtran"):
+            engines.append(("jpegtran",
+                            lambda src, dst: _make_jpegtran_candidate(src, dst, scratch)))
+            engines.append(("pypdf+jpegtran",
+                            lambda src, dst: _make_lossless_pipeline(src, dst, scratch)))
         if mode == "lossy":
             engines.append((f"JPEG SSIM≥{min_ssim:.2f}",
                             lambda src, dst: _make_jpeg_candidate(src, dst, scratch, min_ssim)))
@@ -398,7 +502,8 @@ def optimize_pdf(path: Path, mode: str, dry_run: bool,
                 if size < source_stat.st_size and (best is None or size < best[2]):
                     _check_candidate(candidate, baseline, mode == "lossless")
                     if (mode == "lossy" and name != "pypdf" and
-                            not name.startswith(("JPEG SSIM≥", "MRC SSIM≥"))):
+                            not name.startswith(("JPEG SSIM≥", "MRC SSIM≥")) and
+                            "jpegtran" not in name):
                         if reference is None:
                             reference = _render_pages(path, scratch / "original", len(baseline[0]))
                         if not _visual_similarity(reference, candidate, scratch, min_ssim):

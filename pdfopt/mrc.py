@@ -8,6 +8,7 @@ from io import BytesIO
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import zlib
 
@@ -19,6 +20,41 @@ from pypdf.generic import (ArrayObject, BooleanObject, DictionaryObject,
 
 PROFILES = ((0.50, 75), (0.60, 75), (0.75, 75))
 PREVIEW_MARGIN = 0.012
+JPEG_TIMEOUT = 600
+
+
+def encode_jpeg_trials(bitmap: Image.Image, quality: int,
+                       scratch: Path) -> list[bytes]:
+    """Return JPEG candidates for ``bitmap``, smallest first.
+
+    Pillow always supplies one candidate. When ``cjpeg`` is installed its
+    baseline and progressive encodings are added so the caller can pick the
+    smallest stream that still passes the quality gate.
+    """
+    candidates = []
+    buffer = BytesIO()
+    bitmap.save(buffer, "JPEG", quality=quality, optimize=True)
+    candidates.append(buffer.getvalue())
+    cjpeg = shutil.which("cjpeg")
+    if cjpeg:
+        suffix = ".ppm" if bitmap.mode == "RGB" else ".pgm"
+        source = scratch / f"cjpeg-input{suffix}"
+        target = scratch / "cjpeg-output.jpg"
+        try:
+            bitmap.save(source)
+            for extra in ((), ("-progressive",)):
+                target.unlink(missing_ok=True)
+                completed = subprocess.run(
+                    [cjpeg, "-quality", str(quality), "-optimize", *extra,
+                     "-outfile", str(target), str(source)],
+                    capture_output=True, text=True, check=False,
+                    timeout=JPEG_TIMEOUT, stdin=subprocess.DEVNULL,
+                )
+                if completed.returncode == 0 and target.is_file():
+                    candidates.append(target.read_bytes())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return sorted(set(candidates), key=len)
 
 
 def _image_stream(data: bytes, width: int, height: int, *, stencil: bool,
@@ -114,9 +150,7 @@ def _layers(source_bytes: bytes, stored_size: int,
         small_mask = selection.resize(size, Image.Resampling.BOX)
         small_mask = small_mask.filter(ImageFilter.MaxFilter(7))
         background.paste(background.filter(ImageFilter.MaxFilter(11)), mask=small_mask)
-        output = BytesIO()
-        background.save(output, "JPEG", quality=quality, optimize=True)
-        jpeg = output.getvalue()
+        jpeg = encode_jpeg_trials(background, quality, scratch)[0]
         if len(jpeg) + len(mask_bytes) + 600 >= stored_size:
             continue
         foreground = Image.open(BytesIO(jpeg)).resize(bitmap.size, Image.Resampling.BICUBIC)

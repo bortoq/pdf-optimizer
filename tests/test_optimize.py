@@ -7,15 +7,16 @@ import unittest
 from unittest.mock import patch
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (DecodedStreamObject, DictionaryObject,
+from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
                            EncodedStreamObject, NameObject, NumberObject)
 from PIL import Image, ImageDraw, ImageFont
 
 from pdfopt.cli import main, discover
-from pdfopt.optimize import (MIN_SSIM, _find_worker, _make_mrc_candidate,
-                             _make_pypdf_candidate, _page_ssim,
-                             _pdf_snapshot, _render_page, _render_pages,
-                             optimize_pdf)
+from pdfopt.optimize import (MIN_SSIM, _find_worker, _jpeg_eligible,
+                             _jpegtran_encode, _make_jpegtran_candidate,
+                             _make_mrc_candidate, _make_pypdf_candidate,
+                             _page_ssim, _pdf_snapshot, _render_page,
+                             _render_pages, _same_pixels, optimize_pdf)
 
 
 def make_pdf(path: Path) -> None:
@@ -28,7 +29,8 @@ def make_pdf(path: Path) -> None:
         writer.write(output)
 
 
-def make_scanned_pdf(path: Path, *, text_page: bool = False) -> None:
+def make_scanned_pdf(path: Path, *, text_page: bool = False,
+                     optimize: bool = True) -> None:
     writer = PdfWriter()
     page = writer.add_blank_page(width=300, height=400)
     image = EncodedStreamObject()
@@ -44,7 +46,7 @@ def make_scanned_pdf(path: Path, *, text_page: bool = False) -> None:
         pixels.putdata([((x // 8) % 256, (y // 8) % 256, ((x + y) // 8) % 256)
                         for y in range(500) for x in range(400)])
     encoded = BytesIO()
-    pixels.save(encoded, "JPEG", quality=95, optimize=True)
+    pixels.save(encoded, "JPEG", quality=95, optimize=optimize)
     image._data = encoded.getvalue()
     image.update({
         NameObject("/Type"): NameObject("/XObject"),
@@ -128,6 +130,93 @@ class PypdfCandidateTests(unittest.TestCase):
             self.assertLess(target.stat().st_size, source.stat().st_size)
             with target.open("rb") as stream:
                 self.assertEqual(len(PdfReader(stream, strict=True).pages), 1)
+
+
+def jpeg_object(**overrides):
+    image = DictionaryObject({
+        NameObject("/Filter"): NameObject("/DCTDecode"),
+        NameObject("/BitsPerComponent"): NumberObject(8),
+    })
+    for key, value in overrides.items():
+        image[NameObject("/" + key)] = value
+    return image
+
+
+class JpegEligibilityTests(unittest.TestCase):
+    def test_plain_dct_is_eligible(self):
+        self.assertTrue(_jpeg_eligible(jpeg_object()))
+
+    def test_flate_chain_is_eligible(self):
+        self.assertTrue(_jpeg_eligible(jpeg_object(
+            Filter=ArrayObject([NameObject("/FlateDecode"), NameObject("/DCTDecode")]))))
+
+    def test_flate_only_is_not_eligible(self):
+        self.assertFalse(_jpeg_eligible(jpeg_object(Filter=NameObject("/FlateDecode"))))
+
+    def test_non_8_bit_is_not_eligible(self):
+        self.assertFalse(_jpeg_eligible(jpeg_object(BitsPerComponent=NumberObject(16))))
+
+    def test_masks_and_decode_stay_eligible(self):
+        self.assertTrue(_jpeg_eligible(jpeg_object(SMask=NameObject("/X"))))
+        self.assertTrue(_jpeg_eligible(jpeg_object(Mask=NameObject("/X"))))
+        self.assertTrue(_jpeg_eligible(jpeg_object(Decode=NumberObject(1))))
+
+    def test_decode_parms_is_not_eligible(self):
+        self.assertFalse(_jpeg_eligible(jpeg_object(DecodeParms=DictionaryObject())))
+
+
+class SamePixelsTests(unittest.TestCase):
+    @staticmethod
+    def _jpeg(color, size=(32, 32)):
+        buffer = BytesIO()
+        Image.new("RGB", size, color).save(buffer, "JPEG", quality=90)
+        return buffer.getvalue()
+
+    def test_identical_bytes_match(self):
+        data = self._jpeg((10, 20, 30))
+        self.assertTrue(_same_pixels(data, data))
+
+    def test_different_pixels_do_not_match(self):
+        self.assertFalse(_same_pixels(self._jpeg((10, 20, 30)),
+                                      self._jpeg((200, 10, 10))))
+
+    def test_invalid_data_is_rejected(self):
+        self.assertFalse(_same_pixels(b"nope", b"nope"))
+
+
+@unittest.skipUnless(shutil.which("jpegtran"), "jpegtran не установлен")
+class JpegtranTests(unittest.TestCase):
+    @staticmethod
+    def _jpeg(size=(256, 256)):
+        image = Image.new("RGB", size)
+        image.putdata([((x * 3) % 256, (y * 5) % 256, (x + y) % 256)
+                       for y in range(size[1]) for x in range(size[0])])
+        buffer = BytesIO()
+        image.save(buffer, "JPEG", quality=92)
+        return buffer.getvalue()
+
+    def test_encode_keeps_pixels_when_smaller(self):
+        data = self._jpeg()
+        with tempfile.TemporaryDirectory() as root:
+            encoded = _jpegtran_encode(data, Path(root), shutil.which("jpegtran"))
+        if encoded is not None:
+            self.assertLess(len(encoded), len(data))
+            self.assertTrue(_same_pixels(data, encoded))
+
+    def test_candidate_preserves_page_and_pixels(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            source = directory / "scan.pdf"
+            target = directory / "out.pdf"
+            make_scanned_pdf(source, text_page=True, optimize=False)
+            with source.open("rb") as stream:
+                original = PdfReader(stream).pages[0]["/Resources"]["/XObject"]["/Im0"]._data
+            _make_jpegtran_candidate(source, target, directory)
+            with target.open("rb") as stream:
+                page = PdfReader(stream, strict=True).pages[0]
+                self.assertEqual(page.extract_text().strip(), "OCR text")
+                result = page["/Resources"]["/XObject"]["/Im0"]._data
+            self.assertTrue(_same_pixels(original, result))
 
 
 class SnapshotTests(unittest.TestCase):
