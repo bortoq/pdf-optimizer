@@ -42,9 +42,11 @@ JBIG2_CHUNK = 64
 # Symbol-match threshold by glyph size. Small glyphs in lossy symbol mode
 # swap look-alikes (the Xerox 6/8 case): on 5 pt text at 300 dpi -t 0.80
 # turned 62 sixes into eights, on 4 pt even -t 0.85 swapped 8/6 and e/a.
-# Size is the 90th percentile of vertical ink runs (stem height, px):
-# (minimum stem, threshold), else JBIG2_SAFE_THRESHOLD (jbig2enc's default).
-JBIG2_THRESHOLDS = ((13, 0.80), (11, 0.85))
+# Size is the 90th percentile of vertical ink runs (stem height, px), per
+# band of text rows: (minimum stem, threshold), else JBIG2_SAFE_THRESHOLD
+# (jbig2enc's default). 5 pt digits measure 13 px and still swapped at 0.80,
+# hence the margin; 10 pt text at 300 dpi measures 18-19 px.
+JBIG2_THRESHOLDS = ((15, 0.80), (12, 0.85))
 JBIG2_SAFE_THRESHOLD = 0.92
 PREVIEW_MARGIN = 0.012
 # Compression ratios, strongest first: a flat paper background is tiny in
@@ -168,6 +170,22 @@ def symbol_threshold(stem: float) -> float:
         if stem >= minimum:
             return threshold
     return JBIG2_SAFE_THRESHOLD
+
+
+def size_classes(ink: np.ndarray) -> list[tuple[float, np.ndarray]]:
+    """Split a stencil by the threshold its text allows -> [(threshold, part)].
+
+    Bands of rows between blank rows (text lines, or runs of lines) are sized
+    separately, so small print below normal text (footnotes, captions) gets
+    its own, stricter threshold instead of the page's.
+    """
+    rows = ink.any(axis=1)
+    edges = np.diff(np.concatenate(([0], rows.astype(np.int8), [0])))
+    band = np.zeros(len(rows))
+    for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        band[start:stop] = symbol_threshold(stem_height(ink[start:stop]))
+    return [(threshold, ink & (band == threshold)[:, None])
+            for threshold in sorted(set(band[rows].tolist()))]
 
 
 def _fill_background(small: np.ndarray, known: np.ndarray) -> np.ndarray:
@@ -501,10 +519,16 @@ def find_layers(job: PageJob, minimum: float, scratch: Path,
     del rgb
     inks = []
     for color, stencil in fg.inks:
-        packed = np.packbits(~stencil, axis=1)
-        mask, group4 = _encode_stencil(packed, width, height)
-        inks.append(Ink(color, mask, group4, imagedata.to_png(packed, width, height),
-                        symbol_threshold(stem_height(stencil))))
+        parts = size_classes(stencil) or [(JBIG2_SAFE_THRESHOLD, stencil)]
+        if fg.image is not None:
+            # The colour image is painted through one stencil: keep it whole,
+            # at the strictest threshold of its parts.
+            parts = [(max(threshold for threshold, _ in parts), stencil)]
+        for threshold, part in parts:
+            packed = np.packbits(~part, axis=1)
+            mask, group4 = _encode_stencil(packed, width, height)
+            inks.append(Ink(color, mask, group4, imagedata.to_png(packed, width, height),
+                            threshold))
     page = _Page(bitmap, ink, fg, dpi, minimum)
     if relaxed is not None and relaxed < minimum and page.text_like():
         page.minimum = relaxed
@@ -534,14 +558,13 @@ def _layer_job(args):
 # ---------------------------------------------------------------- JBIG2 ----
 
 def jbig2_streams(stencils: list[bytes], scratch: Path, *, symbols: bool = True,
-                  thresholds: list[float] | None = None):
+                  threshold: float = JBIG2_SAFE_THRESHOLD):
     """Encode stencils with jbig2enc, in chunks.
 
     Symbol mode (``-s``) shares one dictionary per chunk of pages and gives the
-    smallest files, but may merge look-alike glyphs; ``thresholds`` (one per
-    stencil, see ``symbol_threshold``) bound that risk, the strictest of a
-    chunk applies to the whole chunk. ``symbols=False`` codes every page
-    losslessly with the generic region coder.
+    smallest files, but may merge look-alike glyphs; ``threshold`` (see
+    ``symbol_threshold``) bounds that risk. ``symbols=False`` codes every
+    page losslessly with the generic region coder.
 
     Returns ``[(globals or None, [page streams])]`` per chunk, with None for
     chunks where jbig2enc failed; None when jbig2enc is missing.
@@ -552,8 +575,6 @@ def jbig2_streams(stencils: list[bytes], scratch: Path, *, symbols: bool = True,
 
     def encode(index: int):
         chunk = stencils[index:index + JBIG2_CHUNK]
-        threshold = max(thresholds[index:index + JBIG2_CHUNK]) if thresholds \
-            else JBIG2_SAFE_THRESHOLD
         directory = scratch / f"jbig2-{index}"
         directory.mkdir()
         try:
@@ -714,24 +735,24 @@ def add_layers(pdf: pikepdf.Pdf, scratch: Path, minimum: float, jobs: int,
     if not results:
         return []
 
-    # Every ink stencil of every page, in order; JBIG2 chunks run over these.
-    stencils = [(index, ink) for index, (_, layers) in enumerate(results)
-                for ink in layers.inks]
-    chunks = jbig2_streams([ink.stencil_png for _, ink in stencils], scratch,
-                           symbols=symbols,
-                           thresholds=[ink.threshold for _, ink in stencils])
+    # Every ink stencil of every page, in order. Stencils that allow the same
+    # symbol threshold are coded together, in chunks with shared dictionaries.
+    stencils = [ink for _, layers in results for ink in layers.inks]
     symbol_streams: dict[int, tuple] = {}
-    if chunks:
-        for chunk_index, chunk in enumerate(chunks):
+    for threshold in sorted({ink.threshold for ink in stencils}):
+        group = [position for position, ink in enumerate(stencils)
+                 if ink.threshold == threshold]
+        chunks = jbig2_streams([stencils[p].stencil_png for p in group], scratch,
+                               symbols=symbols, threshold=threshold)
+        for chunk_index, chunk in enumerate(chunks or []):
             if chunk is None:
                 continue
-            first = chunk_index * JBIG2_CHUNK
-            members = stencils[first:first + JBIG2_CHUNK]
+            members = group[chunk_index * JBIG2_CHUNK:(chunk_index + 1) * JBIG2_CHUNK]
             jbig2_total = len(chunk[0] or b"") + sum(len(p) for p in chunk[1])
-            if jbig2_total < sum(len(ink.mask) for _, ink in members):
+            if jbig2_total < sum(len(stencils[p].mask) for p in members):
                 shared = _stream(pdf, chunk[0]) if chunk[0] is not None else None
-                for offset, data in enumerate(chunk[1]):
-                    symbol_streams[first + offset] = (data, shared)
+                for position, data in zip(members, chunk[1]):
+                    symbol_streams[position] = (data, shared)
 
     records = []
     position = 0

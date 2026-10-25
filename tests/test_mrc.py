@@ -157,7 +157,7 @@ class StencilTests(unittest.TestCase):
         self.assertEqual(len(pages), 3)
 
     @unittest.skipUnless(need("jbig2"), "jbig2 не установлен")
-    def test_symbol_mode_takes_the_strictest_threshold_of_a_chunk(self):
+    def test_symbol_mode_passes_the_threshold(self):
         bitmap = text_image(600, 800)
         ink = mrc.ink_mask(gray(bitmap), 200)
         stencil = imagedata.to_png(np.packbits(~ink, axis=1), 600, 800)
@@ -169,7 +169,7 @@ class StencilTests(unittest.TestCase):
 
         mrc_run = mrc.run
         with tempfile.TemporaryDirectory() as root, patch.object(mrc, "run", spy):
-            mrc.jbig2_streams([stencil, stencil], Path(root), thresholds=[0.80, 0.85])
+            mrc.jbig2_streams([stencil, stencil], Path(root), threshold=0.85)
             mrc.jbig2_streams([stencil], Path(root))
         thresholds = [command[command.index("-t") + 1] for command in commands]
         self.assertEqual(thresholds, ["0.85", str(mrc.JBIG2_SAFE_THRESHOLD)])
@@ -184,6 +184,22 @@ class StencilTests(unittest.TestCase):
         self.assertEqual(mrc.symbol_threshold(stem(14)), mrc.JBIG2_SAFE_THRESHOLD)
         self.assertEqual(mrc.symbol_threshold(0.0), mrc.JBIG2_SAFE_THRESHOLD)
         self.assertEqual(mrc.stem_height(np.zeros((10, 10), bool)), 0.0)
+
+    def test_small_print_below_normal_text_gets_its_own_stencil(self):
+        page = np.full((1500, 1500, 3), 255, dtype=np.uint8)
+        page[:900] = np.asarray(text_image(1500, 900, size=40, seed=1))
+        page[1000:] = np.asarray(text_image(1500, 500, size=14, seed=2))
+        ink = mrc.ink_mask(gray(Image.fromarray(page)), 300)
+        classes = mrc.size_classes(ink)
+        thresholds = [threshold for threshold, _ in classes]
+        self.assertEqual(thresholds[0], 0.80)
+        self.assertEqual(thresholds[-1], mrc.JBIG2_SAFE_THRESHOLD)
+        strict = classes[-1][1]
+        self.assertTrue(np.array_equal(strict[1000:], ink[1000:]))   # all small print
+        self.assertGreater(classes[0][1][:900].sum(), ink[:900].sum() // 2)
+        parts = np.stack([part for _, part in classes])
+        self.assertTrue(np.array_equal(parts.sum(axis=0), ink))       # a partition
+        self.assertEqual(mrc.size_classes(np.zeros((10, 10), bool)), [])
 
 
     @unittest.skipUnless(need("jbig2"), "jbig2 не установлен")
