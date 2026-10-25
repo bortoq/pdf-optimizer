@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 from dataclasses import dataclass, field
+import itertools
 import os
 from pathlib import Path
 import shutil
@@ -125,11 +127,10 @@ class _Run:
         self.size = path.stat().st_size
         self.errors: list[str] = []
         self.gate: VisualGate | None = None
-        self._sub = 0
+        self._sub = itertools.count(1)   # tasks run in threads
 
     def directory(self, name: str) -> Path:
-        self._sub += 1
-        path = self.scratch / f"{name}-{self._sub}"
+        path = self.scratch / f"{name}-{next(self._sub)}"
         path.mkdir()
         return path
 
@@ -214,20 +215,27 @@ class _Run:
         plain = work / "mrc.pdf"
         chained = work / "mrc-jpeg.pdf"
         saved = []
+        layered = []        # set once the MRC result is verified and saved
 
         def chain(pdf: pikepdf.Pdf) -> None:
+            layered.append(True)
             saved.append(self.jpeg_stage(pdf, chained, work))
 
         try:
             mrc.build(stage, plain, work, self.min_ssim, self.jobs,
                       self.visual_gate(), self.log, then=chain,
                       symbols=not self.safe_text, relaxed=self.mrc_ssim)
-        except ValueError as exc:
-            self.log(f"MRC: {exc}")
-            # Without layered pages the JPEG stage may still help.
-            with open_pdf(stage) as pdf:
-                saved.append(self.jpeg_stage(pdf, chained, work))
-        else:
+        except Exception as exc:   # any failure: keep what is already verified
+            self.log(f"{'JPEG' if layered else 'MRC'}: {exc}")
+            saved.clear()
+            if not layered:
+                # Without layered pages the JPEG stage may still help.
+                try:
+                    with open_pdf(stage) as pdf:
+                        saved.append(self.jpeg_stage(pdf, chained, work))
+                except Exception as error:
+                    self.fail("JPEG", error)
+        if layered:
             out.append(Candidate("MRC", plain, plain.stat().st_size))
         if saved and saved[-1]:
             name = "MRC+JPEG" if out else "JPEG"
@@ -297,8 +305,8 @@ def _timed(log: Log | None) -> Log:
     return lambda message: log(f"{time.monotonic() - start:6.1f} с  {message}")
 
 
-def optimize_pdf(path: Path, mode: str = "lossless", dry_run: bool = False,
-                 min_ssim: float = MIN_SSIM, *, jobs: int | None = None,
+def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
+                 min_ssim: float = MIN_SSIM, jobs: int | None = None,
                  force: bool = False, safe_text: bool = False,
                  mrc_ssim: float | None = None,
                  log: Log | None = None) -> tuple[str, int]:
@@ -378,6 +386,11 @@ def optimize_pdf(path: Path, mode: str = "lossless", dry_run: bool = False,
                 source_stat.st_dev, source_stat.st_ino, source_stat.st_size,
                 source_stat.st_mtime_ns):
             raise ValueError("исходный файл изменился во время обработки")
-        shutil.copystat(path, final)
+        shutil.copystat(path, final)   # mode, times and extended attributes
+        if hasattr(os, "chown") and (current.st_uid, current.st_gid) != (
+                os.getuid(), os.getgid()):
+            # Only root can do this; anyone else only replaces their own files.
+            with contextlib.suppress(PermissionError):
+                os.chown(final, current.st_uid, current.st_gid)
         os.replace(final, path)
         return f"сжато ({best.name})", saving

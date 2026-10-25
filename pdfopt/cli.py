@@ -80,8 +80,8 @@ def _process(task) -> tuple[str, str, int, str]:
             print(f"  {path.name}: {message}", file=sys.stderr, flush=True)
 
     try:
-        status, saved = optimize_pdf(path, mode, dry_run, min_ssim, jobs=jobs,
-                                     force=force, safe_text=safe_text,
+        status, saved = optimize_pdf(path, mode, dry_run=dry_run, min_ssim=min_ssim,
+                                     jobs=jobs, force=force, safe_text=safe_text,
                                      mrc_ssim=mrc_ssim, log=log)
         return str(path), "ok", saved, status
     except Skipped as exc:

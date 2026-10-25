@@ -8,8 +8,8 @@ from unittest.mock import patch
 import numpy as np
 import pikepdf
 
-from pdfopt.optimize import MIN_SSIM, find_worker, optimize_pdf
-from pdfopt.pdfmodel import Skipped, open_pdf, read_marker
+from pdfopt.optimize import MIN_SSIM, _Run, find_worker, optimize_pdf
+from pdfopt.pdfmodel import Fingerprint, Skipped, open_pdf, read_marker
 from pdfopt.tools import ToolError
 
 from .helpers import (
@@ -250,6 +250,76 @@ class LossyTests(unittest.TestCase):
             with self.assertRaises(Skipped):
                 optimize_pdf(book, "lossy", jobs=2)
             self.assertEqual(book.read_bytes(), before)
+
+
+class RobustnessTests(unittest.TestCase):
+    def test_a_crashing_mrc_still_leaves_the_jpeg_stage(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book, pages=2, varied=True, optimize=False)
+            with patch("pdfopt.mrc.build", side_effect=RuntimeError("bug")):
+                status, saved = optimize_pdf(book, "lossy", min_ssim=0.9, jobs=1)
+            self.assertIn("JPEG", status)
+            self.assertGreater(saved, 0)
+
+    def test_a_crashing_jpeg_stage_keeps_the_verified_mrc(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book, pages=2, varied=True)
+            with patch("pdfopt.optimize._Run.jpeg_stage", side_effect=RuntimeError("bug")):
+                status, _ = optimize_pdf(book, "lossy", min_ssim=0.9, jobs=1)
+            self.assertEqual(status, "сжато (MRC)")
+
+
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+class JpegRollbackTests(unittest.TestCase):
+    def test_images_of_rejected_pages_are_put_back(self):
+        with tempfile.TemporaryDirectory() as root:
+            scratch = Path(root)
+            source = scratch / "scan.pdf"
+            make_scan_pdf(source, pages=3, varied=True)
+            with open_pdf(source) as pdf:
+                originals = [bytes(p.Resources.XObject.Im0.read_raw_bytes())
+                             for p in pdf.pages]
+                run = _Run(source, "lossy", 0.5, 1, scratch,
+                           Fingerprint.read(pdf, source), lambda message: None)
+            gate = run.visual_gate()
+            with patch.object(gate, "failures", lambda target, pages, **options: [1]), \
+                    open_pdf(source) as pdf:
+                self.assertTrue(run.jpeg_stage(pdf, scratch / "out.pdf", scratch))
+            with open_pdf(scratch / "out.pdf") as pdf:
+                now = [bytes(p.Resources.XObject.Im0.read_raw_bytes()) for p in pdf.pages]
+            self.assertEqual(now[0], originals[0])
+            self.assertNotEqual(now[1], originals[1])
+            # Nothing passes: nothing is saved and every image is original.
+            with patch.object(gate, "failures", lambda target, pages, **options: list(pages)), \
+                    open_pdf(source) as pdf:
+                self.assertFalse(run.jpeg_stage(pdf, scratch / "none.pdf", scratch))
+                self.assertEqual([bytes(p.Resources.XObject.Im0.read_raw_bytes())
+                                  for p in pdf.pages], originals)
+
+
+@unittest.skipUnless(need("gs", "pdftoppm"), "Ghostscript не установлен")
+class GhostscriptTests(unittest.TestCase):
+    def runs(self, ocr: bool) -> list:
+        import pdfopt.optimize as optimize
+        calls = []
+        real = optimize._make_ghostscript
+
+        def spy(source, target, dpi, qfactor):
+            calls.append(dpi)
+            real(source, target, dpi, qfactor)
+
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book, ocr=ocr, varied=True)
+            with patch.object(optimize, "_make_ghostscript", spy):
+                optimize_pdf(book, "lossy", min_ssim=0.85, jobs=4, dry_run=True)
+        return calls
+
+    def test_offered_only_to_documents_without_text(self):
+        self.assertEqual(sorted(self.runs(ocr=False)), [200, 240, 300])
+        self.assertEqual(self.runs(ocr=True), [])
 
 
 if __name__ == "__main__":

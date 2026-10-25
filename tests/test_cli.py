@@ -71,7 +71,7 @@ class CliTests(unittest.TestCase):
     def test_mrc_quality_reaches_the_optimizer(self):
         seen = []
 
-        def fake(path, mode, dry_run, min_ssim, **options):
+        def fake(path, mode, **options):
             seen.append(options["mrc_ssim"])
             return "без изменений", 0
 

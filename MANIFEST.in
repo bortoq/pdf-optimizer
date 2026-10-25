@@ -1,0 +1,6 @@
+# The ECT extension needs its headers to build from the sdist.
+recursive-include pdfopt/_ect *.c *.cpp *.h License.txt
+recursive-include pdfopt/_ect/zopfli COPYING CONTRIBUTORS
+include THIRD_PARTY_NOTICES CHANGELOG.md
+recursive-include docs *.md
+recursive-include tests *.py

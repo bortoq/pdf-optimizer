@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 import hashlib
 from pathlib import Path
+import re
 
 import pikepdf
 
@@ -61,19 +62,50 @@ def page_resources(page_obj):
     return _inherited(page_obj, "/Resources")
 
 
-def _content_digest(page_obj) -> bytes:
+_TEXT_OBJECT = re.compile(rb"(?:^|\s)BT(?:\s|$)")
+
+
+def _forms_have_text(resources, seen: set) -> bool:
+    """A ``BT`` text object in any Form XObject reachable from ``resources``
+    (undecodable forms count as text)."""
+    xobjects = resources.get("/XObject") if resources is not None else None
+    if xobjects is None:
+        return False
+    for name in list(xobjects.keys()):
+        form = xobjects[name]
+        if form.get("/Subtype") != "/Form" or form.objgen in seen:
+            continue
+        seen.add(form.objgen)
+        try:
+            if _TEXT_OBJECT.search(bytes(form.read_bytes())):
+                return True
+        except (pikepdf.PdfError, ValueError):
+            return True
+        if _forms_have_text(form.get("/Resources"), seen):
+            return True
+    return False
+
+
+def _content_facts(page_obj) -> tuple[bytes, bool]:
+    """Digest of the page content and whether it has text: a ``BT`` text
+    object in the content or its forms. Unused fonts among the resources do
+    not count; undecodable content does."""
+    text = _forms_have_text(page_resources(page_obj), set())
     contents = page_obj.get("/Contents")
     if contents is None:
-        return EMPTY_DIGEST
+        return EMPTY_DIGEST, text
     streams = list(contents) if isinstance(contents, pikepdf.Array) else [contents]
     digest = hashlib.sha256()
     for stream in streams:
         try:
-            digest.update(stream.read_bytes())
+            data = bytes(stream.read_bytes())
+            text = text or _TEXT_OBJECT.search(data) is not None
         except (pikepdf.PdfError, ValueError):
-            digest.update(stream.read_raw_bytes())
+            data = bytes(stream.read_raw_bytes())
+            text = True
+        digest.update(data)
         digest.update(b"\n")
-    return digest.digest()
+    return digest.digest(), text
 
 
 def _box(value) -> tuple[float, ...] | None:
@@ -89,6 +121,7 @@ class PageFacts:
     rotation: int
     annotations: int
     content: bytes
+    text: bool = False
 
 
 @dataclass
@@ -107,12 +140,13 @@ class Fingerprint:
         for page in pdf.pages:
             obj = page.obj
             annots = obj.get("/Annots")
+            digest, text = _content_facts(obj)
             pages.append(PageFacts(
                 _box(_inherited(obj, "/MediaBox")),
                 _box(_inherited(obj, "/CropBox") or _inherited(obj, "/MediaBox")),
                 int(_inherited(obj, "/Rotate", 0) or 0) % 360,
                 len(annots) if annots is not None else 0,
-                _content_digest(obj)))
+                digest, text))
         metadata = tuple(sorted((str(k), str(v)) for k, v in pdf.docinfo.items()))
         xmp = pdf.Root.get("/Metadata")
         if xmp is not None:
@@ -124,7 +158,9 @@ class Fingerprint:
 
     @property
     def has_text_layer(self) -> bool:
-        return any(page.content != EMPTY_DIGEST for page in self.pages)
+        """Any page with text: Ghostscript is only offered to documents
+        without one (its candidates are still checked page by page)."""
+        return any(page.text for page in self.pages)
 
     def text(self) -> tuple:
         """Per-page text digests (slow; only needed when content streams
@@ -243,8 +279,3 @@ def filters_of(obj) -> list[str]:
     if isinstance(value, pikepdf.Array):
         return [str(item) for item in value]
     return [str(value)]
-
-
-def is_name(value, name: str) -> bool:
-    return isinstance(value, pikepdf.Name) and str(value) == name
-

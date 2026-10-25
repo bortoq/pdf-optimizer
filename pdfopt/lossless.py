@@ -118,7 +118,7 @@ def _same_pixels(first: bytes, second: bytes) -> bool:
         with Image.open(io.BytesIO(first)) as a, Image.open(io.BytesIO(second)) as b:
             return (a.mode == b.mode and a.size == b.size and
                     a.tobytes() == b.tobytes())
-    except (OSError, ValueError):
+    except (OSError, ValueError, Image.DecompressionBombError):
         return False
 
 
@@ -161,6 +161,7 @@ class ImageInput:
     jpeg: bytes | None = None
     can_threshold: bool = True      # may an exact black/white picture go 1-bit
     ccitt_source: bool = False
+    can_gray: bool = True           # RGB->Gray keeps the dictionary valid (no /Decode)
 
 
 @dataclass
@@ -221,7 +222,8 @@ def extract(kind: str, obj) -> ImageInput | None:
             return None
         return ImageInput("raw", width, height, bits, ncomp, family, stored, rows,
                           can_threshold="/Matte" not in obj,
-                          ccitt_source=filters_of(obj) == ["/CCITTFaxDecode"])
+                          ccitt_source=filters_of(obj) == ["/CCITTFaxDecode"],
+                          can_gray="/Decode" not in obj)
     except (OSError, ValueError, KeyError, TypeError, pikepdf.PdfError):
         return None
 
@@ -260,7 +262,7 @@ def rewrite(item: ImageInput, scratch: Path, jbig2_ok: bool) -> Replacement | No
                 return None
             return Replacement(encoded, Name.DCTDecode, None, {}, "jpeg")
         return _rewrite_raw(item, scratch, jbig2_ok)
-    except (OSError, ValueError, ToolError, MemoryError):
+    except (OSError, ValueError, ToolError, MemoryError, Image.DecompressionBombError):
         return None
 
 
@@ -270,7 +272,7 @@ def _rewrite_raw(item: ImageInput, scratch: Path, jbig2_ok: bool) -> Replacement
     updates: dict = {}
     notes: list[str] = []
     family = item.family
-    if bits == 8 and family == "rgb" and ncomp == 3:
+    if bits == 8 and family == "rgb" and ncomp == 3 and item.can_gray:
         pixels = rows.reshape(height, width, 3)
         if np.array_equal(pixels[:, :, 0], pixels[:, :, 1]) and \
                 np.array_equal(pixels[:, :, 1], pixels[:, :, 2]):
@@ -394,13 +396,12 @@ def ect_streams(pdf: pikepdf.Pdf, jobs: int) -> bool:
         items.append((stream, data, len(raw) if filters else None))
 
     def pack(item):
-        return _ectdeflate.deflate(item[1], 9)
+        return deflate_zlib(item[1])
 
     # The compressor releases the GIL, so threads scale across cores.
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         packed = list(pool.map(pack, items))
-    for (stream, data, old), raw in zip(items, packed):
-        new = b"\x78\xda" + raw + struct.pack(">I", zlib.adler32(data))
+    for (stream, _, old), new in zip(items, packed):
         if old is not None and len(new) >= old:
             continue
         stream.write(new, filter=Name.FlateDecode,

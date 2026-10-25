@@ -147,6 +147,27 @@ class ImageTests(unittest.TestCase):
             target, _ = build(source, Path(root))
             self.assertEqual(first_image(target)[0]["/BitsPerComponent"], 8)
 
+    def test_gray_rgb_with_a_decode_array_stays_rgb(self):
+        # Six /Decode values would be invalid for a DeviceGray image.
+        rgb = np.stack([stripes(gray=True)] * 3, axis=2)
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "rgb.pdf"
+            make_flate_image_pdf(source, rgb, Decode=pikepdf.Array([1, 0, 1, 0, 1, 0]))
+            target, _ = build(source, Path(root))
+            entries = first_image(target)[0]
+            self.assertEqual(entries["/ColorSpace"], "/DeviceRGB")
+            self.assertEqual(len(entries["/Decode"]), 6)
+
+    def test_flate_bomb_is_inflated_only_as_far_as_the_image_needs(self):
+        pdf = Pdf.new()
+        bomb = zlib.compress(bytes(256 << 20), 9)        # 256 MB of zeros, ~250 KB
+        obj = pikepdf.Stream(pdf, b"")
+        obj.write(bomb, filter=pikepdf.Name.FlateDecode)
+        rows = imagedata.raw_samples(obj, 10, 10, 1, 8)
+        self.assertEqual(rows.shape, (10, 10))
+        # A declared size beyond the limit is not decoded at all.
+        self.assertIsNone(imagedata.raw_samples(obj, 1 << 16, 1 << 14, 1, 8))
+
     def test_color_key_masked_images_are_left_alone(self):
         gray = np.stack([stripes(gray=True)] * 3, axis=2)
         with tempfile.TemporaryDirectory() as root:

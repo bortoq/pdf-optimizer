@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import cache
 from io import BytesIO
 from pathlib import Path
 
@@ -78,6 +79,7 @@ def effective_dpis(pdf: pikepdf.Pdf) -> dict[tuple, float]:
 
 # ----------------------------------------------------------------- encoding --
 
+@cache
 def _mozjpeg() -> str | None:
     cjpeg = which("cjpeg")
     if cjpeg is None:
@@ -289,7 +291,7 @@ def _run(job: Job, minimum: float, scratch: Path):
         if bitmap is None:
             return None
         return reencode(bitmap, job.stored, job.dpi, minimum, scratch)
-    except (OSError, ValueError, MemoryError):
+    except (OSError, ValueError, MemoryError, Image.DecompressionBombError):
         return None
 
 

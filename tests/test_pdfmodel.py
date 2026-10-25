@@ -109,6 +109,27 @@ class FingerprintTests(unittest.TestCase):
             self.assertTrue(facts.has_text_layer)
             self.assertFalse(facts.interactive)
 
+    def test_scan_without_text_has_no_text_layer(self):
+        # The page draws an image (non-empty content) and lists an unused
+        # font: neither is text, so Ghostscript may be offered.
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "scan.pdf"
+            make_scan_pdf(path, ocr=False)
+            self.assertFalse(self.fingerprint(path).has_text_layer)
+
+    def test_text_inside_a_form_counts(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "form.pdf"
+            pdf = pikepdf.Pdf.new()
+            form = pdf.make_stream(b"BT /F1 12 Tf (inside) Tj ET")
+            form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+            form.BBox = [0, 0, 100, 100]
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.Contents = pdf.make_stream(b"q /Fm0 Do Q")
+            page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Fm0=form))
+            pdf.save(path)
+            self.assertTrue(self.fingerprint(path).has_text_layer)
+
 
 class MarkerTests(unittest.TestCase):
     def test_marker_round_trip_and_sticky_lossy_flag(self):

@@ -10,7 +10,7 @@ from PIL import Image
 
 from pdfopt import imagedata, mrc
 from pdfopt.pdfmodel import MRC_FORM_KEY, open_pdf
-from pdfopt.render import VisualGate
+from pdfopt.render import VisualGate, identical_pages
 
 from .helpers import make_scan_pdf, need, text_image
 
@@ -393,6 +393,85 @@ class BuildTests(unittest.TestCase):
                 mrc.restore(records[0])
                 kinds = [str(page.Resources.XObject.Im0.Subtype) for page in pdf.pages]
             self.assertEqual(kinds, ["/Image", "/Form"])
+
+    def test_a_failing_page_does_not_cost_the_others_their_layers(self):
+        real = mrc.find_layers
+
+        def flaky(job, *args, **kwargs):
+            if job.number == 2:
+                raise IndexError("unexpected")
+            return real(job, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "scan.pdf"
+            make_scan_pdf(source, pages=3, varied=True)
+            with open_pdf(source) as pdf, patch.object(mrc, "find_layers", flaky):
+                records = mrc.add_layers(pdf, Path(root), 0.9, 1)
+        self.assertEqual(sorted(r.page for r in records), [1, 3])
+
+
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+class RestoreTests(unittest.TestCase):
+    def test_pages_the_gate_rejects_return_to_the_original_image(self):
+        with tempfile.TemporaryDirectory() as root:
+            scratch = Path(root)
+            source = scratch / "scan.pdf"
+            make_scan_pdf(source, pages=3, varied=True)
+            gate = VisualGate(source, scratch, 0.5, 1)
+
+            def rejecting(target, pages, **options):
+                return [2] if 2 in pages else []
+
+            with patch.object(gate, "failures", rejecting):
+                passed, rejected = mrc.build(source, scratch / "mrc.pdf", scratch, 0.5, 1, gate)
+            self.assertEqual((passed, rejected), (2, 1))
+            with open_pdf(source) as original, open_pdf(scratch / "mrc.pdf") as result:
+                kinds = [str(p.Resources.XObject.Im0.Subtype) for p in result.pages]
+                self.assertEqual(kinds, ["/Form", "/Image", "/Form"])
+                self.assertEqual(
+                    bytes(result.pages[1].Resources.XObject.Im0.read_raw_bytes()),
+                    bytes(original.pages[1].Resources.XObject.Im0.read_raw_bytes()))
+            self.assertTrue(identical_pages(source, scratch / "mrc.pdf", [2],
+                                            scratch / "exact"))
+
+
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+class ColourSpaceTests(unittest.TestCase):
+    def test_icc_scan_keeps_its_colour_space(self):
+        with tempfile.TemporaryDirectory() as root:
+            scratch = Path(root)
+            source = scratch / "scan.pdf"
+            make_scan_pdf(source, color_text=True, icc=True)
+            gate = VisualGate(source, scratch, 0.9, 1)
+            mrc.build(source, scratch / "mrc.pdf", scratch, 0.9, 1, gate)
+            self.assertEqual(gate.failures(scratch / "mrc.pdf", [1]), [])
+            with open_pdf(scratch / "mrc.pdf") as pdf:
+                form = pdf.pages[0].Resources.XObject.Im0
+                background = form.Resources.XObject.Bg
+                self.assertEqual(str(background.ColorSpace[0]), "/ICCBased")
+                self.assertEqual(str(form.Resources.ColorSpace.CS0[0]), "/ICCBased")
+                content = form.read_bytes()
+                self.assertIn(b"/CS0 cs", content)
+                self.assertNotIn(b" rg ", content)
+
+    def test_fill_colour_operators(self):
+        self.assertEqual(mrc._fill_colour((0.5, 0.25, 0.0), False, False),
+                         "0.50000 0.25000 0.00000 rg")
+        self.assertEqual(mrc._fill_colour((0.5, 0.25, 0.0), True, False),
+                         "/CS0 cs 0.50000 0.25000 0.00000 sc")
+        self.assertEqual(mrc._fill_colour((0.3, 0.3, 0.3), True, True),
+                         "/CS0 cs 0.30000 sc")
+
+
+class PaletteTests(unittest.TestCase):
+    def test_palette_colours_are_always_finite(self):
+        rng = np.random.default_rng(11)
+        for _ in range(20):
+            colours = rng.integers(0, 255, (60, 60, 3)).astype(np.float32)
+            palette, distance = mrc._palette(colours, np.ones((60, 60), bool))
+            self.assertTrue(np.isfinite(palette).all())
+            self.assertTrue(np.isfinite(distance).all())
+
 
 if __name__ == "__main__":
     unittest.main()

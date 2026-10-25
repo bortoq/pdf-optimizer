@@ -72,11 +72,21 @@ def image_stream(pdf: Pdf, data: bytes, width: int, height: int, *, filter_name,
 def make_scan_pdf(path: Path, *, pages: int = 1, color_text: bool = False,
                   gray: bool = False, optimize: bool = True, ocr: bool = True,
                   text_page: bool = True, flate: bool = False,
-                  varied: bool = False) -> None:
-    """Scan-like pages: one big image plus an invisible OCR text layer."""
+                  varied: bool = False, icc: bool = False) -> None:
+    """Scan-like pages: one big image plus an invisible OCR text layer.
+
+    ``icc`` tags the (colour) images with an ICCBased sRGB colour space.
+    """
     pdf = Pdf.new()
     font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1,
                                         BaseFont=Name.Helvetica))
+    icc_space = None
+    if icc:
+        from PIL import ImageCms
+        profile = Stream(pdf, ImageCms.ImageCmsProfile(
+            ImageCms.createProfile("sRGB")).tobytes())
+        profile.N = 3
+        icc_space = pikepdf.Array([Name.ICCBased, pdf.make_indirect(profile)])
     for number in range(pages):
         if text_page:
             pixels = text_image(color=color_text,
@@ -87,7 +97,7 @@ def make_scan_pdf(path: Path, *, pages: int = 1, color_text: bool = False,
                             for y in range(500) for x in range(400)])
         if gray:
             pixels = pixels.convert("L")
-        space = Name.DeviceGray if gray else Name.DeviceRGB
+        space = Name.DeviceGray if gray else (icc_space or Name.DeviceRGB)
         if flate:
             import zlib
             image = image_stream(pdf, zlib.compress(pixels.tobytes(), 6),

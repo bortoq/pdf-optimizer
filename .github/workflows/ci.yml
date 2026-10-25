@@ -8,10 +8,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: sudo apt-get update && sudo apt-get install -y poppler-utils libjpeg-turbo-progs libopenjp2-tools
+      # ffmpeg only for the test that checks our SSIM against its ssim filter
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils libjpeg-turbo-progs libopenjp2-tools ghostscript ffmpeg
       # jbig2enc (package "jbig2"); its tests are skipped where it is missing
       - run: sudo apt-get install -y jbig2 || echo "jbig2enc недоступен"
       - run: sudo apt-get install -y build-essential python3-dev
       - run: pip install -e '.[dev]'
       - run: ruff check .
       - run: pytest -q
+      # sdist, then a wheel built from it: catches files missing from MANIFEST.in
+      - run: pip install build && python -m build

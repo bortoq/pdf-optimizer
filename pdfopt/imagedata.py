@@ -14,6 +14,8 @@ from .pdfmodel import filters_of
 
 GENERAL_FILTERS = {"/FlateDecode", "/LZWDecode", "/ASCII85Decode",
                    "/ASCIIHexDecode", "/RunLengthDecode"}
+# Largest decoded image handled (a 600 dpi A2 colour scan is ~300 MB).
+MAX_SAMPLE_BYTES = 512 << 20
 _COMPONENTS = {"/DeviceGray": 1, "/DeviceRGB": 3, "/DeviceCMYK": 4,
                "/CalGray": 1, "/CalRGB": 3}
 
@@ -55,7 +57,9 @@ def jpeg_bytes(obj) -> bytes | None:
                     p is not None and "/Predictor" in p
                     for p in (parms if isinstance(parms, pikepdf.Array) else [parms])):
                 return None
-            return zlib.decompress(bytes(obj.read_raw_bytes()))
+            inflate = zlib.decompressobj()
+            data = inflate.decompress(bytes(obj.read_raw_bytes()), MAX_SAMPLE_BYTES)
+            return None if inflate.unconsumed_tail else data
     except (zlib.error, pikepdf.PdfError, ValueError):
         return None
     return None
@@ -63,22 +67,29 @@ def jpeg_bytes(obj) -> bytes | None:
 
 def raw_samples(obj, width: int, height: int, ncomp: int,
                 bits: int) -> np.ndarray | None:
-    """Decoded sample rows of a generally-filtered image as (height, bytes)."""
-    if any(name not in GENERAL_FILTERS for name in filters_of(obj)):
-        return None
-    try:
-        data = obj.read_bytes()
-    except (pikepdf.PdfError, ValueError):
+    """Decoded sample rows of a generally-filtered image as (height, bytes).
+
+    Images above MAX_SAMPLE_BYTES are skipped, and a plain Flate stream is
+    inflated only up to the size the image needs, so a decompression bomb
+    cannot exhaust memory.
+    """
+    filters = filters_of(obj)
+    if any(name not in GENERAL_FILTERS for name in filters):
         return None
     row = (width * ncomp * bits + 7) // 8
-    if len(data) < row * height:
+    size = row * height
+    if size <= 0 or size > MAX_SAMPLE_BYTES:
         return None
-    return np.frombuffer(data, dtype=np.uint8, count=row * height).reshape(height, row)
-
-
-def unpack_bits(rows: np.ndarray, width: int) -> np.ndarray:
-    """(height, bytes) packed 1-bit rows -> (height, width) uint8 of 0/1."""
-    return np.unpackbits(rows, axis=1)[:, :width]
+    try:
+        if filters == ["/FlateDecode"] and "/DecodeParms" not in obj:
+            data = zlib.decompressobj().decompress(bytes(obj.read_raw_bytes()), size)
+        else:
+            data = obj.read_bytes()
+    except (pikepdf.PdfError, ValueError, zlib.error):
+        return None
+    if len(data) < size:
+        return None
+    return np.frombuffer(data, dtype=np.uint8, count=size).reshape(height, row)
 
 
 def pack_bits(bits: np.ndarray) -> np.ndarray:
@@ -138,7 +149,7 @@ def g4_bitmap(data: bytes, width: int, height: int, black_is_1: bool) -> np.ndar
             bitmap = tiff.convert("1")
             packed = np.frombuffer(bitmap.tobytes(), dtype=np.uint8).reshape(
                 height, (width + 7) // 8).copy()
-    except (OSError, ValueError, SyntaxError):
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
         return None
     # Pillow reports black as 0; with BlackIs1 a PDF reader sees 1.
     return ~packed if black_is_1 else packed
@@ -165,10 +176,6 @@ def box_blur(plane: np.ndarray, radius: int) -> np.ndarray:
         lower = np.take(total, np.arange(0, size), axis=axis)
         out = (upper - lower).astype(np.float32)
     return out
-
-
-def window_counts(shape: tuple[int, int], radius: int) -> np.ndarray:
-    return box_blur(np.ones(shape, dtype=np.float32), radius)
 
 
 def bitmap_from(jpeg: bytes | None, rows: np.ndarray | None, width: int,

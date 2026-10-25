@@ -278,6 +278,9 @@ def _palette(colours: np.ndarray, known: np.ndarray):
         centres = np.array([points[label == k].mean(axis=0) for k in kept]) \
             if kept else np.median(points, axis=0)[None]
     label = ((points[:, None] - centres[None]) ** 2).sum(axis=2).argmin(axis=1)
+    # The last update may leave a centre without cells; it has no colour.
+    centres = centres[np.isin(np.arange(len(centres)), label)]
+    label = ((points[:, None] - centres[None]) ** 2).sum(axis=2).argmin(axis=1)
     palette = np.array([sample[label == k].mean(axis=0) for k in range(len(centres))])
     return palette, np.sqrt(((points - centres[label]) ** 2).sum(axis=1))
 
@@ -552,7 +555,7 @@ def _layer_job(args):
     directory.mkdir(exist_ok=True)
     try:
         return find_layers(job, minimum, directory, relaxed)
-    except (OSError, ValueError, MemoryError, Image.DecompressionBombError):
+    except Exception:   # one odd page must not cost the other pages their layers
         return None
     finally:
         shutil.rmtree(directory, ignore_errors=True)
@@ -629,6 +632,17 @@ def _image(pdf, data, size, *, filter_name, colorspace=None, mask=False, parms=N
                    Subtype=Name.Image, Width=size[0], Height=size[1],
                    BitsPerComponent=1 if mask else 8,
                    **({"ImageMask": True} if mask else {"ColorSpace": colorspace}))
+
+
+def _fill_colour(color: tuple[float, float, float], calibrated: bool,
+                 grayscale: bool) -> str:
+    """Content operators that set the ink colour: DeviceRGB, or the scan's
+    own colour space (/CS0) with one component for gray scans."""
+    if not calibrated:
+        r, g, b = color
+        return f"{r:.5f} {g:.5f} {b:.5f} rg"
+    values = (sum(color) / 3,) if grayscale else color
+    return "/CS0 cs " + " ".join(f"{v:.5f}" for v in values) + " sc"
 
 
 @dataclass
@@ -762,10 +776,15 @@ def add_layers(pdf: pikepdf.Pdf, scratch: Path, minimum: float, jobs: int,
     position = 0
     for scan, layers in results:
         image, users = scan.image, scan.users
+        # Samples keep the scan's colour space (an ICC profile, CalRGB...):
+        # the layers reuse it, and the ink colours are set in it too.
+        space = image.get("/ColorSpace")
+        calibrated = not isinstance(space, pikepdf.Name)
+        device = Name.DeviceGray if layers.grayscale else Name.DeviceRGB
         background = _image(
             pdf, layers.background, layers.bg_size,
             filter_name=Name.JPXDecode if layers.codec == "/JPXDecode" else Name.DCTDecode,
-            colorspace=Name.DeviceGray if layers.grayscale else Name.DeviceRGB)
+            colorspace=space if calibrated else device)
         resources = pikepdf.Dictionary(Bg=background)
         content = "q /Bg Do Q"
         for slot, item in enumerate(layers.inks):
@@ -784,17 +803,22 @@ def add_layers(pdf: pikepdf.Pdf, scratch: Path, minimum: float, jobs: int,
                          mask=True, parms=ink_params)
             resources[f"/Ink{slot}"] = ink
             if layers.foreground is not None:
+                # The colour image is RGB; it keeps a calibrated RGB space.
+                rgb_space = space if calibrated and not layers.grayscale else Name.DeviceRGB
                 fg = _image(pdf, layers.foreground[0], layers.foreground[1],
-                            filter_name=Name.DCTDecode, colorspace=Name.DeviceRGB)
+                            filter_name=Name.DCTDecode, colorspace=rgb_space)
                 fg["/Mask"] = ink
                 resources.Fg = fg
                 content += " q /Fg Do Q"
                 continue
-            r, g, b = item.color
-            content += f" q {r:.5f} {g:.5f} {b:.5f} rg /Ink{slot} Do Q"
+            content += f" q {_fill_colour(item.color, calibrated, layers.grayscale)}" \
+                       f" /Ink{slot} Do Q"
+        form_resources = pikepdf.Dictionary(XObject=resources)
+        if calibrated:
+            form_resources.ColorSpace = pikepdf.Dictionary(CS0=space)
         form = _stream(pdf, content.encode("ascii"), Type=Name.XObject,
                        Subtype=Name.Form, FormType=1, BBox=[0, 0, 1, 1],
-                       Resources=pikepdf.Dictionary(XObject=resources))
+                       Resources=form_resources)
         form[MRC_FORM_KEY] = True
         for number, _, name in users:
             # Give the page its own resource dictionaries so that sibling

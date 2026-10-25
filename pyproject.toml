@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ version = "0.2.0"
 description = "PDF optimizer: lossless recompression, JPEG re-encoding and layered MRC for scans"
 readme = "README.md"
 requires-python = ">=3.11"
+# Bundled third-party code (ECT, Zopfli: Apache 2.0); see THIRD_PARTY_NOTICES.
+license-files = ["THIRD_PARTY_NOTICES", "pdfopt/_ect/License.txt", "pdfopt/_ect/zopfli/COPYING"]
 dependencies = [
     "pikepdf>=9,<11",
     "pypdf>=5,<7",
@@ -26,6 +28,11 @@ dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
 pdfopt = "pdfopt.cli:main"
+
+[tool.setuptools]
+# MANIFEST.in puts the ECT sources into the sdist; the wheel only needs the
+# built module (the licenses go to dist-info via license-files).
+include-package-data = false
 
 [tool.setuptools.packages.find]
 include = ["pdfopt*"]
