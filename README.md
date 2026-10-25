@@ -163,3 +163,9 @@ ruff check .
 
 Тесты, которым нужны `pdftoppm`, `jpegtran`, `jbig2`, `ffmpeg`, пропускаются,
 если программы не установлены.
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE). Встроенные ECT и Zopfli (`pdfopt/_ect`)
+распространяются по Apache License 2.0 — см.
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

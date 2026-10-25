@@ -8,8 +8,10 @@ version = "0.2.0"
 description = "PDF optimizer: lossless recompression, JPEG re-encoding and layered MRC for scans"
 readme = "README.md"
 requires-python = ">=3.11"
-# Bundled third-party code (ECT, Zopfli: Apache 2.0); see THIRD_PARTY_NOTICES.
-license-files = ["THIRD_PARTY_NOTICES", "pdfopt/_ect/License.txt", "pdfopt/_ect/zopfli/COPYING"]
+# pdfopt itself is MIT; the bundled ECT and Zopfli are Apache 2.0 (THIRD_PARTY_NOTICES).
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES", "pdfopt/_ect/License.txt",
+                 "pdfopt/_ect/zopfli/COPYING"]
 dependencies = [
     "pikepdf>=9,<11",
     "pypdf>=5,<7",

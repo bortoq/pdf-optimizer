@@ -33,6 +33,8 @@
 - При замене файла от root сохраняется владелец.
 
 **Сборка**
+- Лицензия MIT (`LICENSE`); пакет в целом — `MIT AND Apache-2.0` из-за
+  встроенных ECT и Zopfli.
 - sdist собирается: `MANIFEST.in` с заголовками ECT; лицензии ECT/Zopfli
   (Apache 2.0) попадают в sdist и в wheel (`license-files`), исходники C++ в
   wheel больше не кладутся. CI собирает sdist и wheel из него.
