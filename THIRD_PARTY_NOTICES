@@ -1,0 +1,5 @@
+pdfopt/_ect — Efficient Compression Tool (ECT) Deflate compressor,
+(c) 2014-2026 Felix Hanau, with Zopfli by Google Inc. (Apache License 2.0).
+Sources were taken from the katzip project with its patches
+(ect.patch, ect_alignment.patch) applied. See pdfopt/_ect/License.txt and
+pdfopt/_ect/zopfli/COPYING.

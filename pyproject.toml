@@ -1,16 +1,46 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdfopt"
-version = "0.1.0"
-description = "Standalone PDF optimizer: lossless recompression, JPEG and layered MRC"
+version = "0.2.0"
+description = "PDF optimizer: lossless recompression, JPEG re-encoding and layered MRC for scans"
+readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pypdf>=6,<7", "Pillow>=10,<13", "numpy>=1.26,<3"]
+dependencies = [
+    "pikepdf>=9,<11",
+    "pypdf>=5,<7",
+    "Pillow>=10,<13",
+    "numpy>=1.26,<3",
+]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Utilities",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
 pdfopt = "pdfopt.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pdfopt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003", "SIM108", "B905"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true

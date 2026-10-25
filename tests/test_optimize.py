@@ -1,423 +1,255 @@
 from pathlib import Path
-from io import BytesIO
-import os
-import shutil
+import stat
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
-                           EncodedStreamObject, NameObject, NumberObject)
-from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import pikepdf
 
-from pdfopt.cli import main, discover
-from pdfopt.optimize import (MIN_SSIM, _find_worker, _jpeg_eligible,
-                             _jpegtran_encode, _make_jpegtran_candidate,
-                             _make_mrc_candidate, _make_pypdf_candidate,
-                             _page_ssim, _pdf_snapshot, _render_page,
-                             _render_pages, _same_pixels, optimize_pdf)
+from pdfopt.optimize import MIN_SSIM, find_worker, optimize_pdf
+from pdfopt.pdfmodel import Skipped, open_pdf, read_marker
+from pdfopt.tools import ToolError
 
-
-def make_pdf(path: Path) -> None:
-    writer = PdfWriter()
-    page = writer.add_blank_page(width=612, height=792)
-    stream = DecodedStreamObject()
-    stream.set_data(b"q\n" + b"0 0 m 100 100 l S\n" * 5000 + b"Q\n")
-    page[NameObject("/Contents")] = writer._add_object(stream)
-    with path.open("wb") as output:
-        writer.write(output)
+from .helpers import (
+    make_flate_image_pdf,
+    make_scan_pdf,
+    make_soft_scan_pdf,
+    make_text_pdf,
+    need,
+    sign,
+    stripes,
+)
 
 
-def make_scanned_pdf(path: Path, *, text_page: bool = False,
-                     optimize: bool = True) -> None:
-    writer = PdfWriter()
-    page = writer.add_blank_page(width=300, height=400)
-    image = EncodedStreamObject()
-    if text_page:
-        pixels = Image.new("RGB", (1200, 1600), "white")
-        draw = ImageDraw.Draw(pixels)
-        font = ImageFont.load_default(size=24)
-        for y in range(80, 1500, 42):
-            draw.text((90, y), "Pdfopt scanned text 12345",
-                      fill=(10, 10, 10), font=font)
-    else:
-        pixels = Image.new("RGB", (400, 500))
-        pixels.putdata([((x // 8) % 256, (y // 8) % 256, ((x + y) // 8) % 256)
-                        for y in range(500) for x in range(400)])
-    encoded = BytesIO()
-    pixels.save(encoded, "JPEG", quality=95, optimize=optimize)
-    image._data = encoded.getvalue()
-    image.update({
-        NameObject("/Type"): NameObject("/XObject"),
-        NameObject("/Subtype"): NameObject("/Image"),
-        NameObject("/Filter"): NameObject("/DCTDecode"),
-        NameObject("/Width"): NumberObject(pixels.width),
-        NameObject("/Height"): NumberObject(pixels.height),
-        NameObject("/ColorSpace"): NameObject("/DeviceRGB"),
-        NameObject("/BitsPerComponent"): NumberObject(8),
-    })
-    font = DictionaryObject({
-        NameObject("/Type"): NameObject("/Font"),
-        NameObject("/Subtype"): NameObject("/Type1"),
-        NameObject("/BaseFont"): NameObject("/Helvetica"),
-    })
-    page[NameObject("/Resources")] = DictionaryObject({
-        NameObject("/XObject"): DictionaryObject({
-            NameObject("/Im0"): writer._add_object(image),
-        }),
-        NameObject("/Font"): DictionaryObject({
-            NameObject("/F1"): writer._add_object(font),
-        }),
-    })
-    contents = DecodedStreamObject()
-    contents.set_data(b"q 300 0 0 400 0 0 cm /Im0 Do Q "
-                      b"BT /F1 12 Tf 50 50 Td (OCR text) Tj ET")
-    page[NameObject("/Contents")] = writer._add_object(contents)
-    with path.open("wb") as output:
-        writer.write(output)
+def worker_script(path: Path, body: str) -> Path:
+    path.write_text(f"#!{sys.executable}\n{body}")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
 
 
 class WorkerDiscoveryTests(unittest.TestCase):
-    def test_explicit_worker_missing_raises(self):
+    def test_worker_is_taken_from_path(self):
         with tempfile.TemporaryDirectory() as root:
-            missing = Path(root) / "hpdf-worker"
-            with self.assertRaises(ValueError):
-                _find_worker(missing)
+            worker = worker_script(Path(root) / "hpdf-worker", "")
+            with patch("pdfopt.optimize.which", return_value=str(worker)):
+                self.assertEqual(find_worker(), worker)
 
-    def test_explicit_worker_returned(self):
-        with tempfile.TemporaryDirectory() as root:
-            worker = Path(root) / "hpdf-worker"
-            worker.write_bytes(b"#!/bin/sh\n")
-            worker.chmod(0o755)
-            found, explicit = _find_worker(worker)
-            self.assertEqual(found, worker)
-            self.assertTrue(explicit)
-
-    def test_env_worker_reported_explicit(self):
-        with tempfile.TemporaryDirectory() as root:
-            worker = Path(root) / "hpdf-worker"
-            worker.write_bytes(b"#!/bin/sh\n")
-            worker.chmod(0o755)
-            with patch.dict(os.environ, {"PDFOPT_HYPER_WORKER": str(worker)}, clear=False):
-                with patch("pdfopt.optimize.shutil.which", return_value=None):
-                    found, explicit = _find_worker(None)
-            self.assertEqual(found, worker)
-            self.assertTrue(explicit)
-
-    def test_env_worker_unavailable_raises(self):
-        with patch.dict(os.environ, {"PDFOPT_HYPER_WORKER": "/nope/hpdf-worker"}, clear=False):
-            with self.assertRaises(ValueError):
-                _find_worker(None)
-
-    def test_absent_worker_is_optional(self):
-        env = {key: "" for key in
-               ("PDFOPT_HYPER_WORKER", "BIBLIOPTER_HYPER_WORKER", "HYPER_DRV")}
-        with patch.dict(os.environ, env, clear=False):
-            with patch("pdfopt.optimize.shutil.which", return_value=None):
-                found, explicit = _find_worker(None)
-        self.assertIsNone(found)
-        self.assertFalse(explicit)
+    def test_absent_worker_gives_none(self):
+        with patch("pdfopt.optimize.which", return_value=None):
+            self.assertIsNone(find_worker())
 
 
-class PypdfCandidateTests(unittest.TestCase):
-    def test_candidate_is_smaller_and_readable(self):
-        with tempfile.TemporaryDirectory() as root:
-            source = Path(root) / "book.pdf"
-            target = Path(root) / "out.pdf"
-            make_pdf(source)
-            _make_pypdf_candidate(source, target)
-            self.assertLess(target.stat().st_size, source.stat().st_size)
-            with target.open("rb") as stream:
-                self.assertEqual(len(PdfReader(stream, strict=True).pages), 1)
-
-
-def jpeg_object(**overrides):
-    image = DictionaryObject({
-        NameObject("/Filter"): NameObject("/DCTDecode"),
-        NameObject("/BitsPerComponent"): NumberObject(8),
-    })
-    for key, value in overrides.items():
-        image[NameObject("/" + key)] = value
-    return image
-
-
-class JpegEligibilityTests(unittest.TestCase):
-    def test_plain_dct_is_eligible(self):
-        self.assertTrue(_jpeg_eligible(jpeg_object()))
-
-    def test_flate_chain_is_eligible(self):
-        self.assertTrue(_jpeg_eligible(jpeg_object(
-            Filter=ArrayObject([NameObject("/FlateDecode"), NameObject("/DCTDecode")]))))
-
-    def test_flate_only_is_not_eligible(self):
-        self.assertFalse(_jpeg_eligible(jpeg_object(Filter=NameObject("/FlateDecode"))))
-
-    def test_non_8_bit_is_not_eligible(self):
-        self.assertFalse(_jpeg_eligible(jpeg_object(BitsPerComponent=NumberObject(16))))
-
-    def test_masks_and_decode_stay_eligible(self):
-        self.assertTrue(_jpeg_eligible(jpeg_object(SMask=NameObject("/X"))))
-        self.assertTrue(_jpeg_eligible(jpeg_object(Mask=NameObject("/X"))))
-        self.assertTrue(_jpeg_eligible(jpeg_object(Decode=NumberObject(1))))
-
-    def test_decode_parms_is_not_eligible(self):
-        self.assertFalse(_jpeg_eligible(jpeg_object(DecodeParms=DictionaryObject())))
-
-
-class SamePixelsTests(unittest.TestCase):
-    @staticmethod
-    def _jpeg(color, size=(32, 32)):
-        buffer = BytesIO()
-        Image.new("RGB", size, color).save(buffer, "JPEG", quality=90)
-        return buffer.getvalue()
-
-    def test_identical_bytes_match(self):
-        data = self._jpeg((10, 20, 30))
-        self.assertTrue(_same_pixels(data, data))
-
-    def test_different_pixels_do_not_match(self):
-        self.assertFalse(_same_pixels(self._jpeg((10, 20, 30)),
-                                      self._jpeg((200, 10, 10))))
-
-    def test_invalid_data_is_rejected(self):
-        self.assertFalse(_same_pixels(b"nope", b"nope"))
-
-
-@unittest.skipUnless(shutil.which("jpegtran"), "jpegtran не установлен")
-class JpegtranTests(unittest.TestCase):
-    @staticmethod
-    def _jpeg(size=(256, 256)):
-        image = Image.new("RGB", size)
-        image.putdata([((x * 3) % 256, (y * 5) % 256, (x + y) % 256)
-                       for y in range(size[1]) for x in range(size[0])])
-        buffer = BytesIO()
-        image.save(buffer, "JPEG", quality=92)
-        return buffer.getvalue()
-
-    def test_encode_keeps_pixels_when_smaller(self):
-        data = self._jpeg()
-        with tempfile.TemporaryDirectory() as root:
-            encoded = _jpegtran_encode(data, Path(root), shutil.which("jpegtran"))
-        if encoded is not None:
-            self.assertLess(len(encoded), len(data))
-            self.assertTrue(_same_pixels(data, encoded))
-
-    def test_candidate_preserves_page_and_pixels(self):
-        with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
-            source = directory / "scan.pdf"
-            target = directory / "out.pdf"
-            make_scanned_pdf(source, text_page=True, optimize=False)
-            with source.open("rb") as stream:
-                original = PdfReader(stream).pages[0]["/Resources"]["/XObject"]["/Im0"]._data
-            _make_jpegtran_candidate(source, target, directory)
-            with target.open("rb") as stream:
-                page = PdfReader(stream, strict=True).pages[0]
-                self.assertEqual(page.extract_text().strip(), "OCR text")
-                result = page["/Resources"]["/XObject"]["/Im0"]._data
-            self.assertTrue(_same_pixels(original, result))
-
-
-class SnapshotTests(unittest.TestCase):
-    def test_snapshot_reports_single_page_without_interactive(self):
+class LosslessTests(unittest.TestCase):
+    def test_dry_run_then_replacement(self):
         with tempfile.TemporaryDirectory() as root:
             book = Path(root) / "book.pdf"
-            make_pdf(book)
-            pages, metadata, interactive = _pdf_snapshot(book)
-            self.assertEqual(len(pages), 1)
-            self.assertFalse(interactive)
-
-
-class CliTests(unittest.TestCase):
-    def test_lossless_pdf_dry_run_and_replacement(self):
-        with tempfile.TemporaryDirectory() as root:
-            book = Path(root) / "book.pdf"
-            make_pdf(book)
+            make_text_pdf(book)
+            with pikepdf.open(book, allow_overwriting_input=True) as pdf:
+                pdf.save(book, compress_streams=False)
             original = book.read_bytes()
-            self.assertEqual(main(["--dry-run", str(book)]), 0)
+            status, saved = optimize_pdf(book, "lossless", dry_run=True, jobs=2)
+            self.assertGreater(saved, 0)
+            self.assertIn("возможная экономия", status)
             self.assertEqual(book.read_bytes(), original)
-            self.assertEqual(main([str(book)]), 0)
-            self.assertLess(book.stat().st_size, len(original))
-            with book.open("rb") as stream:
-                reader = PdfReader(stream, strict=True)
-                self.assertEqual(len(reader.pages), 1)
-                self.assertEqual(float(reader.pages[0].mediabox.width), 612)
+            status, saved = optimize_pdf(book, "lossless", jobs=2)
+            self.assertIn("сжато", status)
+            self.assertEqual(book.stat().st_size, len(original) - saved)
+            with open_pdf(book) as pdf:
+                self.assertEqual(len(pdf.pages), 1)
 
-    def test_signed_pdf_is_preserved(self):
+    def test_marker_prevents_a_second_pass_until_forced(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            make_text_pdf(book)
+            with pikepdf.open(book, allow_overwriting_input=True) as pdf:
+                pdf.save(book, compress_streams=False)
+            optimize_pdf(book, "lossless", jobs=2)
+            with open_pdf(book) as pdf:
+                self.assertEqual(read_marker(pdf)[1], False)
+            self.assertEqual(optimize_pdf(book, "lossless", jobs=2),
+                             ("уже оптимизирован", 0))
+            status, _ = optimize_pdf(book, "lossless", force=True, jobs=2)
+            self.assertEqual(status, "без изменений")
+
+    def test_metadata_and_page_text_are_preserved(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            make_scan_pdf(book, optimize=False)
+            with pikepdf.open(book, allow_overwriting_input=True) as pdf:
+                pdf.docinfo["/Title"] = "Original"
+                pdf.save(book, compress_streams=False)
+            optimize_pdf(book, "lossless", jobs=2)
+            with open_pdf(book) as pdf:
+                self.assertEqual(str(pdf.docinfo["/Title"]), "Original")
+                self.assertIn(b"OCR text", pdf.pages[0].Contents.read_bytes())
+
+    def test_signed_pdf_is_skipped_and_untouched(self):
         with tempfile.TemporaryDirectory() as root:
             book = Path(root) / "signed.pdf"
-            make_pdf(book)
-            with book.open("ab") as output:
-                output.write(b"\n% /ByteRange [0 1 2 3]\n")
+            make_text_pdf(book)
+            sign(book)
             original = book.read_bytes()
-            self.assertEqual(main([str(book)]), 1)
+            with self.assertRaises(Skipped):
+                optimize_pdf(book, "lossless", jobs=2)
             self.assertEqual(book.read_bytes(), original)
 
-    def test_quality_with_lossless_is_rejected(self):
+    def test_unreadable_pdf_is_an_error(self):
         with tempfile.TemporaryDirectory() as root:
-            book = Path(root) / "book.pdf"
-            make_pdf(book)
-            self.assertEqual(main(["-q", "96", "--lossless", str(book)]), 2)
-
-    def test_quality_out_of_range_is_rejected(self):
-        with tempfile.TemporaryDirectory() as root:
-            book = Path(root) / "book.pdf"
-            make_pdf(book)
-            self.assertEqual(main(["-q", "0", str(book)]), 2)
-
-    def test_missing_path_returns_two(self):
-        self.assertEqual(main(["/definitely/missing/book.pdf"]), 2)
-
-
-class DiscoverTests(unittest.TestCase):
-    def test_collects_pdf_recursively_without_symlinks(self):
-        with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
-            (directory / "a.pdf").write_bytes(b"%PDF")
-            (directory / "b.txt").write_text("x")
-            nested = directory / "sub"
-            nested.mkdir()
-            (nested / "c.PDF").write_bytes(b"%PDF")
-            try:
-                (directory / "link.pdf").symlink_to(directory / "a.pdf")
-            except OSError:
-                pass
-            found = discover([directory], True)
-            self.assertEqual(sorted(p.name for p in found), ["a.pdf", "c.PDF"])
-
-    def test_non_recursive_ignores_subdirectories(self):
-        with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
-            (directory / "a.pdf").write_bytes(b"%PDF")
-            nested = directory / "sub"
-            nested.mkdir()
-            (nested / "c.pdf").write_bytes(b"%PDF")
-            found = discover([directory], False)
-            self.assertEqual([p.name for p in found], ["a.pdf"])
-
-
-class SsimTests(unittest.TestCase):
-    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg не установлен")
-    def test_identical_images_score_one_and_change_scores_less(self):
-        with tempfile.TemporaryDirectory() as root:
-            before = Path(root) / "before.png"
-            same = Path(root) / "same.png"
-            after = Path(root) / "after.png"
-            image = Image.new("RGB", (128, 128), (240, 230, 220))
-            for x in range(20, 110):
-                for y in range(20, 110):
-                    image.putpixel((x, y), (x * 2, y * 2, (x + y) % 256))
-            image.save(before)
-            image.save(same)
-            changed = image.copy()
-            for x in range(20, 110):
-                for y in range(20, 110):
-                    changed.putpixel((x, y), (0, 0, 0))
-            changed.save(after)
-            self.assertEqual(_page_ssim(before, same), 1.0)
-            self.assertLess(_page_ssim(before, after), 1.0)
-
-    @unittest.skipUnless(shutil.which("pdftoppm"), "pdftoppm не установлен")
-    def test_render_page_rejects_unknown_suffix(self):
-        with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
-            book = directory / "book.pdf"
-            make_pdf(book)
+            book = Path(root) / "bad.pdf"
+            book.write_bytes(b"%PDF-1.4 nothing here")
             with self.assertRaises(ValueError):
-                _render_page(book, 1, directory / "page.bmp")
+                optimize_pdf(book, "lossless", jobs=2)
 
-
-class LossyToolTests(unittest.TestCase):
-    @unittest.skipUnless(all(shutil.which(command) for command in
-                             ("gs", "pdftoppm", "ffmpeg")),
-                         "PDF lossy tools are not installed")
-    def test_lossy_pdf_recompresses_image_with_page_ssim_gate(self):
-        with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
-            book = directory / "scan.pdf"
-            make_scanned_pdf(book)
-            original_size = book.stat().st_size
-            with book.open("rb") as stream:
-                original_image = PdfReader(stream).pages[0]["/Resources"]["/XObject"]["/Im0"]._data
-            original_page = _render_pages(book, directory / "before", 1)[0]
-
-            self.assertEqual(main(["-q", "96", str(book)]), 0)
-            self.assertLess(book.stat().st_size, original_size)
-            result_page = _render_pages(book, directory / "after", 1)[0]
-            self.assertGreaterEqual(_page_ssim(original_page, result_page), MIN_SSIM)
-            with book.open("rb") as stream:
-                page = PdfReader(stream).pages[0]
-                self.assertEqual(page.extract_text().strip(), "OCR text")
-                objects = page["/Resources"]["/XObject"]
-                image = next(iter(objects.values()))
-                self.assertEqual(image.get_object()["/Filter"], "/DCTDecode")
-                self.assertLess(len(image.get_object()._data), len(original_image))
-
-            make_scanned_pdf(book)
-            self.assertEqual(main(["-q", "100", str(book)]), 0)
-            with book.open("rb") as stream:
-                objects = PdfReader(stream).pages[0]["/Resources"]["/XObject"]
-                image = next(iter(objects.values()))
-                self.assertEqual(image.get_object()._data, original_image)
-
-
-class MrcToolTests(unittest.TestCase):
-    @unittest.skipUnless(all(shutil.which(command) for command in
-                             ("pdftoppm", "ffmpeg")),
-                         "PDF MRC verification tools are not installed")
-    def test_mrc_layers_preserve_ocr_and_pass_page_ssim(self):
-        with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
-            original = directory / "scan.pdf"
-            candidate = directory / "layered.pdf"
-            make_scanned_pdf(original, text_page=True)
-            before = _render_pages(original, directory / "before", 1)[0]
-            _make_mrc_candidate(original, candidate, directory)
-            self.assertLess(candidate.stat().st_size, original.stat().st_size)
-            after = _render_pages(candidate, directory / "after", 1)[0]
-            self.assertGreaterEqual(_page_ssim(before, after), MIN_SSIM)
-            with candidate.open("rb") as stream:
-                page = PdfReader(stream).pages[0]
-                self.assertEqual(page.extract_text().strip(), "OCR text")
-                form = next(iter(page["/Resources"]["/XObject"].values())).get_object()
-                self.assertEqual(form["/Subtype"], "/Form")
-                layers = form["/Resources"]["/XObject"]
-                self.assertEqual(layers["/Bg"]["/Filter"], "/DCTDecode")
-                self.assertTrue(layers["/Ink"]["/ImageMask"])
-
-    @unittest.skipUnless(all(shutil.which(command) for command in
-                             ("pdftoppm", "ffmpeg")),
-                         "PDF MRC verification tools are not installed")
-    def test_mrc_reverts_only_page_below_ssim_threshold(self):
-        with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
-            first, second = directory / "first.pdf", directory / "second.pdf"
-            source, target = directory / "both.pdf", directory / "result.pdf"
-            make_scanned_pdf(first, text_page=True)
-            make_scanned_pdf(second, text_page=True)
-            writer = PdfWriter()
-            writer.append(str(first))
-            writer.append(str(second))
-            with source.open("wb") as output:
-                writer.write(output)
-            with patch("pdfopt.optimize._page_ssim", side_effect=(.99, .99, .99, .10)):
-                _make_mrc_candidate(source, target, directory)
-            with target.open("rb") as stream:
-                pages = PdfReader(stream).pages
-                types = [next(iter(page["/Resources"]["/XObject"].values()))
-                         .get_object()["/Subtype"] for page in pages]
-                self.assertEqual(types, ["/Form", "/Image"])
-
-
-class OptimizeApiTests(unittest.TestCase):
-    def test_optimize_returns_status_and_saving(self):
+    def test_unknown_mode_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
             book = Path(root) / "book.pdf"
-            make_pdf(book)
-            status, saving = optimize_pdf(book, "lossless", True)
-            self.assertIn("возможная экономия", status)
-            self.assertGreater(saving, 0)
+            make_text_pdf(book)
+            with self.assertRaises(ValueError):
+                optimize_pdf(book, "turbo")
+
+    def test_file_changed_during_processing_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            make_text_pdf(book)
+            with pikepdf.open(book, allow_overwriting_input=True) as pdf:
+                pdf.save(book, compress_streams=False)
+            touched = []
+
+            def log(message):
+                if not touched:
+                    touched.append(True)
+                    with book.open("ab") as stream:
+                        stream.write(b"\n%changed\n")
+
+            with self.assertRaises(ValueError) as caught:
+                optimize_pdf(book, "lossless", jobs=2, log=log)
+            self.assertIn("изменился", str(caught.exception))
+            self.assertTrue(book.read_bytes().endswith(b"%changed\n"))
+
+    def test_no_temporary_files_are_left_behind(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            make_text_pdf(book)
+            optimize_pdf(book, "lossless", jobs=2)
+            self.assertEqual([p.name for p in Path(root).iterdir()], ["book.pdf"])
+
+
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+class FallbackTests(unittest.TestCase):
+    def test_without_a_renderer_image_rewrites_are_dropped_not_the_file(self):
+        gray = stripes(gray=True)
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "rgb.pdf"
+            make_flate_image_pdf(book, np.stack([gray] * 3, axis=2))
+            before = book.stat().st_size
+            with patch("pdfopt.render.require", side_effect=ToolError("pdftoppm не найден")):
+                status, saved = optimize_pdf(book, "lossless", jobs=2)
+            self.assertIn("lossless-safe", status)
+            with open_pdf(book) as pdf:
+                self.assertEqual(str(pdf.pages[0].Resources.XObject.Im0.ColorSpace),
+                                 "/DeviceRGB")
+            self.assertEqual(book.stat().st_size, before - saved)
+
+
+class WorkerTests(unittest.TestCase):
+    def test_failing_worker_does_not_break_the_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            make_text_pdf(book)
+            worker = worker_script(Path(root) / "w", "import sys; sys.exit(3)")
+            with patch("pdfopt.optimize.find_worker", return_value=worker):
+                status, _ = optimize_pdf(book, "lossless", jobs=1)
+            self.assertIn("сжато", status)
+
+    @unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+    def test_lossless_worker_output_is_verified(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            make_text_pdf(book, lines=20)
+            # A "worker" that silently destroys the page.
+            worker = worker_script(Path(root) / "w", (
+                "import sys, pikepdf\n"
+                "pdf = pikepdf.new()\n"
+                "pdf.add_blank_page(page_size=(612, 792))\n"
+                "pdf.save(sys.argv[2])\n"))
+            before = book.read_bytes()
+            with patch("pdfopt.optimize.find_worker", return_value=worker):
+                optimize_pdf(book, "lossless", jobs=1, dry_run=True)
+            self.assertEqual(book.read_bytes(), before)
+            with open_pdf(book) as pdf:
+                self.assertIsNone(read_marker(pdf))
+
+
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+class LossyTests(unittest.TestCase):
+    def test_scan_is_layered_and_text_survives(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book, pages=2)
+            before = book.stat().st_size
+            status, saved = optimize_pdf(book, "lossy", min_ssim=0.96, jobs=2)
+            self.assertIn("MRC", status)
+            self.assertGreater(saved, before * 0.7)
+            with open_pdf(book) as pdf:
+                self.assertEqual(len(pdf.pages), 2)
+                self.assertEqual(read_marker(pdf)[1], True)
+                self.assertIn(b"OCR text", pdf.pages[1].Contents.read_bytes())
+
+    def test_lossy_runs_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book)
+            optimize_pdf(book, "lossy", min_ssim=0.96, jobs=2)
+            self.assertEqual(optimize_pdf(book, "lossy", min_ssim=0.96, jobs=2),
+                             ("уже оптимизирован", 0))
+            # A lossless pass over a lossy file is also pointless.
+            self.assertEqual(optimize_pdf(book, "lossless", jobs=2),
+                             ("уже оптимизирован", 0))
+
+    def test_lossless_marked_file_still_gets_the_lossy_pass(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book, optimize=False)
+            optimize_pdf(book, "lossless", jobs=2)
+            with open_pdf(book) as pdf:
+                self.assertEqual(read_marker(pdf)[1], False)
+            status, _ = optimize_pdf(book, "lossy", min_ssim=0.96, jobs=2)
+            self.assertIn("сжато", status)
+
+    def test_unreachable_quality_keeps_the_lossless_result(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book, optimize=False)
+            status, _ = optimize_pdf(book, "lossy", min_ssim=1.0, jobs=2)
+            self.assertIn("lossless", status)
+
+    def test_soft_scan_is_layered_under_the_text_threshold(self):
+        with tempfile.TemporaryDirectory() as root:
+            sizes = {}
+            for mrc_ssim in (0.96, None):     # same as -q, then the default
+                book = Path(root) / f"scan-{mrc_ssim}.pdf"
+                make_soft_scan_pdf(book)
+                status, _ = optimize_pdf(book, "lossy", min_ssim=0.96,
+                                         mrc_ssim=mrc_ssim, jobs=2)
+                sizes[mrc_ssim] = (status, book.stat().st_size)
+            self.assertNotIn("MRC", sizes[0.96][0])
+            self.assertEqual(sizes[None][0], "сжато (MRC)")
+            self.assertLess(sizes[None][1] * 5, sizes[0.96][1])
+
+    def test_default_threshold_constant(self):
+        self.assertAlmostEqual(MIN_SSIM, 0.96)
+
+    def test_signed_scan_is_never_touched(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book)
+            sign(book)
+            before = book.read_bytes()
+            with self.assertRaises(Skipped):
+                optimize_pdf(book, "lossy", jobs=2)
+            self.assertEqual(book.read_bytes(), before)
 
 
 if __name__ == "__main__":

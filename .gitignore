@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 build/
 dist/
+.pytest_cache/
+.ruff_cache/
+.pdfopt-*/
+*.so
