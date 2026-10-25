@@ -43,11 +43,13 @@ JBIG2_CHUNK = 64
 # swap look-alikes (the Xerox 6/8 case): on 5 pt text at 300 dpi -t 0.80
 # turned 62 sixes into eights, on 4 pt even -t 0.85 swapped 8/6 and e/a.
 # Size is the 90th percentile of vertical ink runs (stem height, px), per
-# band of text rows: (minimum stem, threshold), else JBIG2_SAFE_THRESHOLD
-# (jbig2enc's default). 5 pt digits measure 13 px and still swapped at 0.80,
-# hence the margin; 10 pt text at 300 dpi measures 18-19 px.
-JBIG2_THRESHOLDS = ((15, 0.80), (12, 0.85))
-JBIG2_SAFE_THRESHOLD = 0.92
+# band of text rows: (minimum stem, threshold), else JBIG2_LOSSLESS. 5 pt
+# digits measure 13 px and still swapped at 0.80, hence the margin; 10 pt
+# text at 300 dpi measures 18-19 px. Below 10 px no threshold is safe (on
+# 3.5 pt glyphs even -t 0.92 turned 9 into 8), so such text is coded
+# losslessly. jbig2enc 0.28 (Ubuntu 24.04) rejects thresholds above 0.9.
+JBIG2_THRESHOLDS = ((15, 0.80), (12, 0.85), (10, 0.90))
+JBIG2_LOSSLESS = 1.0             # generic region coding, no symbol matching
 PREVIEW_MARGIN = 0.012
 # Compression ratios, strongest first: a flat paper background is tiny in
 # JPEG 2000 (~1 KB per page at 100 dpi) where JPEG cannot go below ~4 KB.
@@ -165,11 +167,12 @@ def stem_height(ink: np.ndarray) -> float:
 
 
 def symbol_threshold(stem: float) -> float:
-    """JBIG2 symbol-match threshold that is safe for glyphs of ``stem`` px."""
+    """JBIG2 symbol-match threshold that is safe for glyphs of ``stem`` px,
+    or JBIG2_LOSSLESS when no symbol matching is."""
     for minimum, threshold in JBIG2_THRESHOLDS:
         if stem >= minimum:
             return threshold
-    return JBIG2_SAFE_THRESHOLD
+    return JBIG2_LOSSLESS
 
 
 def size_classes(ink: np.ndarray) -> list[tuple[float, np.ndarray]]:
@@ -519,7 +522,7 @@ def find_layers(job: PageJob, minimum: float, scratch: Path,
     del rgb
     inks = []
     for color, stencil in fg.inks:
-        parts = size_classes(stencil) or [(JBIG2_SAFE_THRESHOLD, stencil)]
+        parts = size_classes(stencil) or [(JBIG2_LOSSLESS, stencil)]
         if fg.image is not None:
             # The colour image is painted through one stencil: keep it whole,
             # at the strictest threshold of its parts.
@@ -558,13 +561,14 @@ def _layer_job(args):
 # ---------------------------------------------------------------- JBIG2 ----
 
 def jbig2_streams(stencils: list[bytes], scratch: Path, *, symbols: bool = True,
-                  threshold: float = JBIG2_SAFE_THRESHOLD):
+                  threshold: float = JBIG2_THRESHOLDS[-1][1]):
     """Encode stencils with jbig2enc, in chunks.
 
     Symbol mode (``-s``) shares one dictionary per chunk of pages and gives the
     smallest files, but may merge look-alike glyphs; ``threshold`` (see
-    ``symbol_threshold``) bounds that risk. ``symbols=False`` codes every
-    page losslessly with the generic region coder.
+    ``symbol_threshold``) bounds that risk. ``symbols=False`` or a
+    JBIG2_LOSSLESS threshold codes every page losslessly with the generic
+    region coder.
 
     Returns ``[(globals or None, [page streams])]`` per chunk, with None for
     chunks where jbig2enc failed; None when jbig2enc is missing.
@@ -583,7 +587,7 @@ def jbig2_streams(stencils: list[bytes], scratch: Path, *, symbols: bool = True,
                 path = directory / f"s{number:05d}.png"
                 path.write_bytes(data)
                 paths.append(path)
-            if not symbols:
+            if not symbols or threshold >= JBIG2_LOSSLESS:
                 pages = []
                 for path in paths:
                     target = path.with_suffix(".jb2")

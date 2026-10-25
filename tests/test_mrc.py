@@ -172,7 +172,20 @@ class StencilTests(unittest.TestCase):
             mrc.jbig2_streams([stencil, stencil], Path(root), threshold=0.85)
             mrc.jbig2_streams([stencil], Path(root))
         thresholds = [command[command.index("-t") + 1] for command in commands]
-        self.assertEqual(thresholds, ["0.85", str(mrc.JBIG2_SAFE_THRESHOLD)])
+        self.assertEqual(thresholds, ["0.85", "0.9"])
+        # jbig2enc 0.28 (Ubuntu 24.04) rejects -t above 0.9.
+        self.assertLessEqual(max(t for _, t in mrc.JBIG2_THRESHOLDS), 0.9)
+
+    @unittest.skipUnless(need("jbig2"), "jbig2 не установлен")
+    def test_lossless_threshold_uses_the_generic_coder(self):
+        bitmap = text_image(600, 800)
+        ink = mrc.ink_mask(gray(bitmap), 200)
+        stencil = imagedata.to_png(np.packbits(~ink, axis=1), 600, 800)
+        with tempfile.TemporaryDirectory() as root:
+            (symbols, pages), = mrc.jbig2_streams([stencil, stencil], Path(root),
+                                                  threshold=mrc.JBIG2_LOSSLESS)
+        self.assertIsNone(symbols)
+        self.assertEqual(len(pages), 2)
 
     def test_small_glyphs_get_a_safer_threshold(self):
         # 6/8 swaps appeared at 4-5 pt in a 300 dpi scan, not at 6-7 pt.
@@ -181,8 +194,8 @@ class StencilTests(unittest.TestCase):
             return mrc.stem_height(mrc.ink_mask(gray(image), 300))
 
         self.assertEqual(mrc.symbol_threshold(stem(40)), 0.80)
-        self.assertEqual(mrc.symbol_threshold(stem(14)), mrc.JBIG2_SAFE_THRESHOLD)
-        self.assertEqual(mrc.symbol_threshold(0.0), mrc.JBIG2_SAFE_THRESHOLD)
+        self.assertEqual(mrc.symbol_threshold(stem(14)), mrc.JBIG2_LOSSLESS)
+        self.assertEqual(mrc.symbol_threshold(0.0), mrc.JBIG2_LOSSLESS)
         self.assertEqual(mrc.stem_height(np.zeros((10, 10), bool)), 0.0)
 
     def test_small_print_below_normal_text_gets_its_own_stencil(self):
@@ -193,7 +206,7 @@ class StencilTests(unittest.TestCase):
         classes = mrc.size_classes(ink)
         thresholds = [threshold for threshold, _ in classes]
         self.assertEqual(thresholds[0], 0.80)
-        self.assertEqual(thresholds[-1], mrc.JBIG2_SAFE_THRESHOLD)
+        self.assertEqual(thresholds[-1], mrc.JBIG2_LOSSLESS)
         strict = classes[-1][1]
         self.assertTrue(np.array_equal(strict[1000:], ink[1000:]))   # all small print
         self.assertGreater(classes[0][1][:900].sum(), ink[:900].sum() // 2)
@@ -326,7 +339,9 @@ class BuildTests(unittest.TestCase):
                 scratch.mkdir()
                 target = scratch / "mrc.pdf"
                 gate = VisualGate(source, scratch, 0.96, 2)
-                with patch.object(mrc, "JBIG2_CHUNK", 2):
+                # Small test glyphs would be coded losslessly: force symbol mode.
+                with patch.object(mrc, "JBIG2_CHUNK", 2), \
+                        patch.object(mrc, "JBIG2_THRESHOLDS", ((0, 0.90),)):
                     mrc.build(source, target, scratch, 0.96, 2, gate, symbols=symbols)
                 self.assertEqual(gate.failures(target, [1, 2, 3]), [])
                 with open_pdf(target) as pdf:
