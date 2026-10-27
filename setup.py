@@ -14,6 +14,7 @@ setup(ext_modules=[Extension(
              f"{ECT}/zopfli/squeeze.c", f"{ECT}/zopfli/util.c",
              f"{ECT}/zopfli/deflate.cpp", f"{ECT}/zopfli/katajainen.cpp"],
     include_dirs=[ECT],
+    optional=True,                  # without it streams are packed with zlib
     extra_compile_args=["/O2"] if MSVC else ["-O2"],
     extra_link_args=[] if MSVC else ["-pthread"],
     libraries=[] if MSVC else ["stdc++", "m"],

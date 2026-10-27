@@ -171,6 +171,11 @@ python -m unittest discover -s tests -t .   # или: pytest
 ruff check .
 ```
 
+CI гоняет тесты на Linux, macOS и Windows (Poppler, Ghostscript и ffmpeg ставятся
+пакетными менеджерами; тесты, которым нужен jbig2enc или OpenJPEG, там
+пропускаются). Модуль ECT собирается и под MSVC; если сборка не удалась,
+установка не ломается — потоки сжимаются zlib.
+
 Тесты, которым нужны `pdftoppm`, `jbig2`, `ffmpeg`, `gs`, пропускаются,
 если программы не установлены.
 
