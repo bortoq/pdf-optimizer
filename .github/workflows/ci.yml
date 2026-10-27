@@ -2,17 +2,28 @@ name: ci
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       # ffmpeg only for the test that checks our SSIM against its ssim filter
-      - run: sudo apt-get update && sudo apt-get install -y poppler-utils libopenjp2-tools ghostscript ffmpeg
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils libopenjp2-tools ghostscript ffmpeg
       # jbig2enc (package "jbig2"); its tests are skipped where it is missing
-      - run: sudo apt-get install -y jbig2 || echo "jbig2enc недоступен"
-      - run: sudo apt-get install -y build-essential python3-dev
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y jbig2 || echo "jbig2enc недоступен"
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y build-essential python3-dev
+      - if: runner.os == 'macOS'
+        run: brew install poppler ghostscript openjpeg ffmpeg
+      - if: runner.os == 'Windows'
+        run: choco install -y poppler ghostscript ffmpeg
       - run: pip install -e '.[dev]'
       - run: ruff check .
       - run: pytest -q
