@@ -41,6 +41,57 @@ class CliTests(unittest.TestCase):
             self.assertEqual(run(book)[0], 0)
             self.assertLess(book.stat().st_size, len(original))
 
+    def test_quiet_run_prints_only_the_total(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            plain_pdf(book)
+            code, out, err = run(book)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertNotIn(str(book), out)
+            self.assertRegex(out, r"Экономия: [\d.]+ \S+ \([\d.]+%\)")
+
+    def test_progress_bar_goes_to_a_terminal_only(self):
+        class Terminal(StringIO):
+            def isatty(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            plain_pdf(book)
+            out, err = StringIO(), Terminal()
+            with redirect_stdout(out), redirect_stderr(err):
+                main([str(book)])
+            self.assertIn("1/1", err.getvalue())
+            self.assertIn("%", err.getvalue())
+
+    def test_encrypted_file_needs_decrypt_flag(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "locked.pdf"
+            plain_pdf(book)
+            with pikepdf.open(book, allow_overwriting_input=True) as pdf:
+                pdf.save(book, compress_streams=False,
+                         encryption=pikepdf.Encryption(owner="o", user=""))
+            original = book.read_bytes()
+            self.assertIn("--decrypt", run(book)[1])
+            self.assertEqual(book.read_bytes(), original)
+            self.assertEqual(run("--decrypt", book)[0], 0)
+            with pikepdf.open(book) as pdf:
+                self.assertFalse(pdf.is_encrypted)
+                self.assertEqual(len(pdf.pages), 1)
+
+    def test_password_protected_file_stays_skipped(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "locked.pdf"
+            plain_pdf(book)
+            with pikepdf.open(book, allow_overwriting_input=True) as pdf:
+                pdf.save(book, encryption=pikepdf.Encryption(owner="o", user="u"))
+            original = book.read_bytes()
+            code, out, _ = run("--decrypt", book)
+            self.assertEqual(code, 0)
+            self.assertIn("нужен пароль", out)
+            self.assertEqual(book.read_bytes(), original)
+
     def test_signed_pdf_is_skipped_with_exit_zero(self):
         with tempfile.TemporaryDirectory() as root:
             book = Path(root) / "signed.pdf"
@@ -105,14 +156,15 @@ class CliTests(unittest.TestCase):
             with patch("pdfopt.cli.find_worker", return_value=None):
                 code, _, err = run(book)
             self.assertEqual(code, 0)
-            self.assertIn("hpdf-worker не найден", err)
+            self.assertNotIn("hpdf-worker", err)
+            self.assertIn("hpdf-worker не найден", run("-v", book)[2])
 
     def test_several_files_in_parallel(self):
         with tempfile.TemporaryDirectory() as root:
             books = [Path(root) / f"b{i}.pdf" for i in range(3)]
             for book in books:
                 plain_pdf(book)
-            code, out, _ = run(root)
+            code, out, _ = run("-v", root)
             self.assertEqual(code, 0)
             for book in books:
                 self.assertIn(str(book), out)
@@ -129,8 +181,8 @@ class CliTests(unittest.TestCase):
             book = Path(root) / "book.pdf"
             plain_pdf(book)
             run(book)
-            self.assertIn("уже оптимизирован", run(book)[1])
-            self.assertNotIn("уже оптимизирован", run("--force", book)[1])
+            self.assertIn("уже оптимизирован", run("-v", book)[1])
+            self.assertNotIn("уже оптимизирован", run("-v", "--force", book)[1])
 
 
 class DiscoverTests(unittest.TestCase):

@@ -24,12 +24,12 @@ def open_pdf(path: Path) -> pikepdf.Pdf:
     try:
         pdf = pikepdf.open(path)
     except pikepdf.PasswordError as exc:
-        raise Skipped("зашифрованный файл не поддерживается") from exc
+        raise Skipped("нужен пароль") from exc
     except (pikepdf.PdfError, OSError) as exc:
         raise ValueError(f"PDF: не удалось прочитать исходник: {exc}") from exc
     if pdf.is_encrypted:
         pdf.close()
-        raise Skipped("зашифрованный файл не поддерживается")
+        raise Skipped("зашифрованный файл (--decrypt снимает шифрование)")
     return pdf
 
 

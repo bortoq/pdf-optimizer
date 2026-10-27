@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import io
+import logging
 import zlib
 
 from fontTools import subset as ftsubset
@@ -27,6 +28,10 @@ import pikepdf
 from pikepdf import Name
 
 from .pdfmodel import page_resources
+
+# fontTools warns about every slightly malformed table of a font; the font is
+# still usable, and the cut is verified pixel-for-pixel, so the noise is dropped.
+logging.getLogger("fontTools").setLevel(logging.ERROR)
 
 # WinAnsiEncoding is cp1252; its five holes decode to nothing.
 _WINANSI = {code: char for code in range(256)

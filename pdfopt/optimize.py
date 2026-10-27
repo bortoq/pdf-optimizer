@@ -308,7 +308,7 @@ def _timed(log: Log | None) -> Log:
 def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
                  min_ssim: float = MIN_SSIM, jobs: int | None = None,
                  force: bool = False, safe_text: bool = False,
-                 mrc_ssim: float | None = None,
+                 mrc_ssim: float | None = None, decrypt: bool = False,
                  log: Log | None = None) -> tuple[str, int]:
     """Choose the smallest verified PDF and replace the source atomically.
 
@@ -317,8 +317,37 @@ def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
     ``safe_text`` codes MRC ink masks losslessly (no JBIG2 symbol
     dictionaries). ``mrc_ssim`` is the SSIM required of layered text pages
     (default ``min_ssim - MRC_ALLOWANCE``; none below a perfect 1.0). All
-    cores are used unless ``jobs`` says otherwise.
+    cores are used unless ``jobs`` says otherwise. ``decrypt`` also takes
+    files that open without a password: they are decrypted first, so the
+    result carries no encryption and none of the owner's restrictions.
     """
+    options = {"dry_run": dry_run, "min_ssim": min_ssim, "jobs": jobs, "force": force,
+               "safe_text": safe_text, "mrc_ssim": mrc_ssim, "log": log}
+    if not decrypt:
+        return _optimize(path, path, mode, **options)
+    with tempfile.TemporaryDirectory(prefix=".pdfopt-open-", dir=path.parent) as keep:
+        return _optimize(path, _decrypted(path, Path(keep)), mode, **options)
+
+
+def _decrypted(path: Path, directory: Path) -> Path:
+    """The file itself, or an unencrypted copy of it when no password is needed."""
+    try:
+        with pikepdf.open(path) as pdf:
+            if not pdf.is_encrypted:
+                return path
+            copy = directory / "decrypted.pdf"
+            pdf.save(copy, compress_streams=False)   # the stages do the compressing
+            return copy
+    except pikepdf.PasswordError as exc:
+        raise Skipped("нужен пароль") from exc
+    except (pikepdf.PdfError, OSError) as exc:
+        raise ValueError(f"PDF: не удалось прочитать исходник: {exc}") from exc
+
+
+def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: float,
+              jobs: int | None, force: bool, safe_text: bool, mrc_ssim: float | None,
+              log: Log | None) -> tuple[str, int]:
+    """``optimize_pdf`` on ``work``, the readable copy of ``path`` to replace."""
     if mrc_ssim is None:
         mrc_ssim = min_ssim - MRC_ALLOWANCE if min_ssim < 1.0 else min_ssim
     if mode not in ("lossless", "lossy"):
@@ -326,11 +355,11 @@ def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
     jobs = max(1, jobs or os.cpu_count() or 1)
     log = _timed(log)
     source_stat = path.stat()
-    with open_pdf(path) as pdf:
+    with open_pdf(work) as pdf:
         if has_signature(pdf):
             raise Skipped("документ с электронной подписью не изменён")
         marker = read_marker(pdf)
-        baseline = Fingerprint.read(pdf, path)
+        baseline = Fingerprint.read(pdf, work)
     lossy = mode == "lossy"
     if not force and marker and marker[0] >= MARKER_VERSION and (marker[1] or not lossy):
         return "уже оптимизирован", 0
@@ -342,7 +371,7 @@ def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
 
     with tempfile.TemporaryDirectory(prefix=".pdfopt-", dir=path.parent) as directory:
         scratch = Path(directory)
-        state = _Run(path, mode, min_ssim, jobs, scratch, baseline, log, safe_text,
+        state = _Run(work, mode, min_ssim, jobs, scratch, baseline, log, safe_text,
                      mrc_ssim)
         candidates: list[Candidate] = []
         stage = state.lossless_stage()
@@ -350,7 +379,7 @@ def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
             candidates.append(stage)
         tasks: list[Task] = []
         if lossy:
-            base = stage.path if stage is not None else path
+            base = stage.path if stage is not None else work
             tasks.append(Task("MRC", lambda: state.mrc_engine(base)))
         tasks.extend(state.external_tasks(worker))
 
