@@ -9,7 +9,7 @@ jobs:
         with:
           python-version: "3.11"
       # ffmpeg only for the test that checks our SSIM against its ssim filter
-      - run: sudo apt-get update && sudo apt-get install -y poppler-utils libjpeg-turbo-progs libopenjp2-tools ghostscript ffmpeg
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils libopenjp2-tools ghostscript ffmpeg
       # jbig2enc (package "jbig2"); its tests are skipped where it is missing
       - run: sudo apt-get install -y jbig2 || echo "jbig2enc недоступен"
       - run: sudo apt-get install -y build-essential python3-dev

@@ -4,7 +4,8 @@ Passes (each optional and independent):
 
 * structure: drop page thumbnails, merge identical streams;
 * images: RGB->Gray, 8->1 bit, PNG predictors, Group 4/Flate -> JBIG2 generic;
-* JPEG: ``jpegtran`` Huffman optimization / progressive scans (pixel-checked);
+* JPEG: mozjpeg Huffman optimization / progressive scans (pixel-checked);
+* fonts: embedded TrueType fonts cut to the glyphs in use (pixel-checked);
 * streams: ECT -9 instead of zlib, then qpdf object/xref streams on save.
 """
 
@@ -20,12 +21,13 @@ import struct
 import tempfile
 import zlib
 
+import mozjpeg_lossless_optimization
 import numpy as np
 import pikepdf
 from pikepdf import Name
 from PIL import Image
 
-from . import imagedata
+from . import fonts, imagedata
 from .pdfmodel import collect_images, filters_of, iter_streams, open_pdf
 from .tools import ToolError, run, which
 
@@ -39,7 +41,7 @@ pikepdf.settings.set_flate_compression_level(9)
 MIN_GAIN = 0.98            # an image rewrite must save at least 2 %
 MIN_JBIG2_PIXELS = 100_000
 ECT_BUDGET = 256 << 20     # bytes of raw data re-deflated per document
-JPEGTRAN_PROFILES = (("-optimize",), ("-optimize", "-progressive"))
+ECT_FAST_ABOVE = 4 << 20   # streams above this get ECT level 6 instead of 9
 
 
 @dataclass
@@ -122,25 +124,21 @@ def _same_pixels(first: bytes, second: bytes) -> bool:
         return False
 
 
-def _jpegtran(data: bytes, scratch: Path) -> bytes | None:
-    jpegtran = which("jpegtran")
-    if jpegtran is None:
+def optimize_jpeg(data: bytes) -> bytes | None:
+    """The same JPEG coefficients in fewer bytes, or None.
+
+    mozjpeg's ``jpegtran`` (optimized Huffman tables, searched progressive
+    scans; no extra markers, like ``-copy none``) beats libjpeg's by 0.7 % on
+    photo scans and up to 28 % on smooth images. The pixels are compared
+    after decoding all the same.
+    """
+    try:
+        encoded = mozjpeg_lossless_optimization.optimize(data)
+    except ValueError:
         return None
-    source = scratch / "in.jpg"
-    target = scratch / "out.jpg"
-    source.write_bytes(data)
-    best = None
-    for profile in JPEGTRAN_PROFILES:
-        target.unlink(missing_ok=True)
-        done = run([jpegtran, "-copy", "none", *profile,
-                    "-outfile", str(target), str(source)])
-        if done.returncode == 0 and target.is_file():
-            encoded = target.read_bytes()
-            if len(encoded) < len(data) and (best is None or len(encoded) < len(best)):
-                best = encoded
-    if best is None or not _same_pixels(data, best):
+    if len(encoded) >= len(data) or not _same_pixels(data, encoded):
         return None
-    return best
+    return encoded
 
 
 # ------------------------------------------------------------- image tasks --
@@ -257,7 +255,7 @@ def rewrite(item: ImageInput, scratch: Path, jbig2_ok: bool) -> Replacement | No
     """Pick the smallest equivalent encoding of one image (thread-safe)."""
     try:
         if item.kind == "jpeg":
-            encoded = _jpegtran(item.jpeg, scratch)
+            encoded = optimize_jpeg(item.jpeg)
             if encoded is None:
                 return None
             return Replacement(encoded, Name.DCTDecode, None, {}, "jpeg")
@@ -367,14 +365,20 @@ def ect_available() -> bool:
     return _ectdeflate is not None
 
 
-def deflate_zlib(data: bytes) -> bytes:
-    """A zlib stream whose Deflate part is made like ``ect -9``."""
-    return (b"\x78\xda" + _ectdeflate.deflate(data, 9) +
+def ect_mode(size: int) -> int:
+    """ECT level for ``size`` raw bytes: 9, or 6 for big streams, which is
+    4-8 times faster and only 0.03-0.3 % larger (a 25 MB image: 38 s -> ~5 s)."""
+    return 9 if size <= ECT_FAST_ABOVE else 6
+
+
+def deflate_zlib(data: bytes, mode: int = 9) -> bytes:
+    """A zlib stream whose Deflate part is made like ``ect -<mode>``."""
+    return (b"\x78\xda" + _ectdeflate.deflate(data, mode) +
             struct.pack(">I", zlib.adler32(data)))
 
 
 def ect_streams(pdf: pikepdf.Pdf, jobs: int) -> bool:
-    """Re-deflate Flate/unfiltered streams with ECT -9; True if it ran."""
+    """Re-deflate Flate/unfiltered streams with ECT; True if it ran."""
     if _ectdeflate is None:
         return False
     items = []
@@ -387,7 +391,13 @@ def ect_streams(pdf: pikepdf.Pdf, jobs: int) -> bool:
             continue
         raw = bytes(stream.read_raw_bytes())
         try:
-            data = zlib.decompress(raw) if filters else raw
+            if filters:   # inflate no further than the budget left (no bombs)
+                inflate = zlib.decompressobj()
+                data = inflate.decompress(raw, budget + 1)
+                if inflate.unconsumed_tail:
+                    continue
+            else:
+                data = raw
         except zlib.error:
             continue
         if len(data) < 64 or len(data) > budget:
@@ -396,7 +406,7 @@ def ect_streams(pdf: pikepdf.Pdf, jobs: int) -> bool:
         items.append((stream, data, len(raw) if filters else None))
 
     def pack(item):
-        return deflate_zlib(item[1])
+        return deflate_zlib(item[1], ect_mode(len(item[1])))
 
     # The compressor releases the GIL, so threads scale across cores.
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
@@ -430,6 +440,11 @@ def build(source: Path, target: Path, scratch: Path, jobs: int = 1, *,
         visual, counts = optimize_images(pdf, scratch, jobs,
                                          transforms=transforms, jbig2=jbig2)
         notes.extend(f"{name}×{count}" for name, count in sorted(counts.items()))
+        if transforms:
+            font_pages, cut = fonts.subset_fonts(pdf)
+            if cut:
+                visual |= font_pages
+                notes.append(f"fonts×{cut}")
         deflated = ect_streams(pdf, jobs) if ect else False
         save(pdf, target, deflated=deflated)
     return Report(visual, notes)

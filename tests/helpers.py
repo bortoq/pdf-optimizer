@@ -213,3 +213,102 @@ def sign(path: Path) -> None:
             FT=Name.Sig, T=pikepdf.String("Sig1"), V=signature))
         pdf.Root.AcroForm = Dictionary(Fields=[field], SigFlags=3)
         pdf.save(path)
+
+
+def truetype_font(glyphs: int = 200) -> bytes:
+    """A TrueType font with ``glyphs`` distinct, detailed glyphs mapped from
+    U+0041 on (so cutting unused glyphs is measurable)."""
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+    names = [".notdef"] + [f"g{i:03d}" for i in range(glyphs)]
+    outlines = {}
+    for index, name in enumerate(names):
+        pen = TTGlyphPen(None)
+        # A star-like polygon whose shape depends on the glyph index.
+        points = []
+        for k in range(24):
+            radius = 300 if k % 2 else 150 + (index * 37 + k * 11) % 140
+            angle = 2 * np.pi * k / 24 + index * 0.01
+            points.append((int(350 + radius * np.cos(angle)), int(350 + radius * np.sin(angle))))
+        pen.moveTo(points[0])
+        for point in points[1:]:
+            pen.lineTo(point)
+        pen.closePath()
+        outlines[name] = pen.glyph()
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder(names)
+    builder.setupCharacterMap({0x41 + i: f"g{i:03d}" for i in range(glyphs)})
+    builder.setupGlyf(outlines)
+    builder.setupHorizontalMetrics(dict.fromkeys(names, (700, 50)))
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupNameTable({"familyName": "PdfoptTest", "styleName": "Regular"})
+    builder.setupOS2()
+    builder.setupPost()
+    output = BytesIO()
+    builder.save(output)
+    return output.getvalue()
+
+
+def make_font_pdf(path: Path, *, kind: str = "simple", text: str = "ABAC",
+                  in_form: bool = False, annotation: bool = False, acroform: bool = False,
+                  orphan_user: bool = False, encoding: str = "/Identity-H") -> None:
+    """A page showing ``text`` with an embedded TrueType font.
+
+    kind: "simple" (WinAnsi TrueType) or "cid" (Type0/CIDFontType2, codes =
+    glyph ids). ``in_form`` draws the text inside a form XObject,
+    ``annotation`` (also) in an annotation appearance, ``orphan_user`` adds an
+    unreachable font dictionary sharing the program.
+    """
+    import zlib
+    pdf = Pdf.new()
+    data = truetype_font()
+    program = pdf.make_stream(zlib.compress(data, 9))
+    program.Filter, program.Length1 = Name.FlateDecode, len(data)
+    descriptor = pdf.make_indirect(Dictionary(
+        Type=Name.FontDescriptor, FontName=Name("/PdfoptTest"), Flags=32,
+        FontBBox=[0, -200, 1000, 800], ItalicAngle=0, Ascent=800, Descent=-200,
+        CapHeight=700, StemV=80, FontFile2=program))
+    if kind == "simple":
+        font = Dictionary(Type=Name.Font, Subtype=Name.TrueType, BaseFont=Name("/PdfoptTest"),
+                          FirstChar=32, LastChar=255, Widths=[700] * 224,
+                          Encoding=Name.WinAnsiEncoding, FontDescriptor=descriptor)
+        shown = pikepdf.String(text.encode("cp1252"))
+    else:
+        cid = Dictionary(Type=Name.Font, Subtype=Name.CIDFontType2,
+                         BaseFont=Name("/PdfoptTest"), FontDescriptor=descriptor,
+                         CIDSystemInfo=Dictionary(Registry="Adobe", Ordering="Identity",
+                                                  Supplement=0),
+                         CIDToGIDMap=Name.Identity, DW=700)
+        font = Dictionary(Type=Name.Font, Subtype=Name.Type0, BaseFont=Name("/PdfoptTest"),
+                          Encoding=Name(encoding), DescendantFonts=[pdf.make_indirect(cid)])
+        # glyph id of the k-th letter is k + 1 (after .notdef)
+        shown = pikepdf.String(b"".join((ord(c) - 0x41 + 1).to_bytes(2, "big") for c in text))
+    font = pdf.make_indirect(font)
+    if orphan_user:
+        pdf.Root.Orphan = pdf.make_indirect(Dictionary(
+            Type=Name.Font, Subtype=Name.TrueType, BaseFont=Name("/PdfoptTest"),
+            Encoding=Name.WinAnsiEncoding, FontDescriptor=descriptor))
+    text_ops = b"BT /F1 48 Tf 40 100 Td " + shown.unparse() + b" Tj ET"
+    resources = Dictionary(Font=Dictionary(F1=font))
+    if in_form:
+        form = pdf.make_stream(text_ops)
+        form.Type, form.Subtype, form.BBox = Name.XObject, Name.Form, [0, 0, 400, 200]
+        form.Resources = resources
+        page = _page(pdf, 400, 200, b"q /Fm0 Do Q",
+                     Dictionary(XObject=Dictionary(Fm0=form)))
+    else:
+        page = _page(pdf, 400, 200, text_ops, resources)
+    if annotation:
+        appearance = pdf.make_stream(b"BT /F1 24 Tf 10 10 Td "
+                                     + (pikepdf.String(b"Z").unparse() if kind == "simple"
+                                        else pikepdf.String((26).to_bytes(2, "big")).unparse())
+                                     + b" Tj ET")
+        appearance.Type, appearance.Subtype = Name.XObject, Name.Form
+        appearance.BBox, appearance.Resources = [0, 0, 100, 50], resources
+        page.Annots = pdf.make_indirect(pikepdf.Array([pdf.make_indirect(Dictionary(
+            Type=Name.Annot, Subtype=Name.Stamp, Rect=[250, 20, 350, 70],
+            AP=Dictionary(N=appearance)))]))
+    if acroform:
+        pdf.Root.AcroForm = Dictionary(Fields=[], DR=resources)
+    pdf.save(path)

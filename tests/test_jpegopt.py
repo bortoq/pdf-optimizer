@@ -115,6 +115,14 @@ class ReencodeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             self.assertIsNone(jpegopt.reencode(bitmap, stored, None, 0.99, Path(root)))
 
+    def test_tighten_keeps_pixels_and_never_grows(self):
+        plain = jpegopt.encode(photo(), 80)
+        tight = jpegopt.tighten(plain)
+        self.assertLess(len(tight), len(plain))
+        with Image.open(BytesIO(plain)) as a, Image.open(BytesIO(tight)) as b:
+            self.assertEqual(a.tobytes(), b.tobytes())
+        self.assertEqual(jpegopt.tighten(b"not a jpeg"), b"not a jpeg")
+
 
 class DocumentTests(unittest.TestCase):
     def run_stage(self, path, minimum=0.95):

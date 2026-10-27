@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import zlib
 
 import numpy as np
@@ -113,6 +114,44 @@ class EctTests(unittest.TestCase):
     def test_empty_input(self):
         self.assertEqual(lossless.deflate_zlib(b""), zlib.compress(b"", 9)[:0] +
                          b"\x78\xda\x03\x00\x00\x00\x00\x01")
+
+    def test_modes_outside_2_to_9_are_refused(self):
+        # Mode 1 never returned (on a 2 MB image band); it must not be reachable.
+        for mode in (0, 1, 10):
+            with self.subTest(mode), self.assertRaises(ValueError):
+                lossless._ectdeflate.deflate(b"pdfopt" * 100, mode)
+        for mode in (2, 6, 9):
+            data = b"pdfopt" * 100
+            self.assertEqual(zlib.decompress(lossless.deflate_zlib(data, mode)), data)
+
+    def test_big_streams_get_the_faster_level(self):
+        self.assertEqual(lossless.ect_mode(lossless.ECT_FAST_ABOVE), 9)
+        self.assertEqual(lossless.ect_mode(lossless.ECT_FAST_ABOVE + 1), 6)
+        pdf = Pdf.new()
+        small, big = (pdf.make_stream(bytes(size)) for size in (1000, 5000))
+        modes = []
+        real = lossless.deflate_zlib
+
+        def spy(data, mode=9):
+            modes.append((len(data), mode))
+            return real(data, mode)
+
+        with patch.object(lossless, "ECT_FAST_ABOVE", 2000), \
+                patch.object(lossless, "deflate_zlib", spy):
+            lossless.ect_streams(pdf, 1)
+        self.assertEqual(sorted(modes), [(1000, 9), (5000, 6)])
+        self.assertEqual(small.read_bytes(), bytes(1000))
+        self.assertEqual(big.read_bytes(), bytes(5000))
+
+    def test_streams_beyond_the_budget_are_not_inflated(self):
+        pdf = Pdf.new()
+        stream = pikepdf.Stream(pdf, b"")
+        stream.write(zlib.compress(bytes(64 << 20), 9), filter=pikepdf.Name.FlateDecode)
+        pdf.make_indirect(stream)
+        before = bytes(stream.read_raw_bytes())
+        with patch.object(lossless, "ECT_BUDGET", 1 << 20):
+            lossless.ect_streams(pdf, 1)
+        self.assertEqual(bytes(stream.read_raw_bytes()), before)
 
 
 class ImageTests(unittest.TestCase):
@@ -250,7 +289,6 @@ class Jbig2Tests(unittest.TestCase):
         self.check("g4", True)
 
 
-@unittest.skipUnless(need("jpegtran"), "jpegtran не установлен")
 class JpegTests(unittest.TestCase):
     def test_pixels_survive_and_file_shrinks(self):
         with tempfile.TemporaryDirectory() as root:
@@ -264,6 +302,16 @@ class JpegTests(unittest.TestCase):
                     Image.open(__import__("io").BytesIO(after)) as b:
                 self.assertEqual(a.tobytes(), b.tobytes())
             self.assertLess(target.stat().st_size, source.stat().st_size)
+
+    def test_mozjpeg_rewrite_keeps_every_pixel(self):
+        original = jpeg_bytes(text_image(400, 300, color=True), quality=90)
+        smaller = lossless.optimize_jpeg(original)
+        self.assertIsNotNone(smaller)
+        self.assertLess(len(smaller), len(original))
+        self.assertTrue(lossless._same_pixels(original, smaller))
+        self.assertIsNone(lossless.optimize_jpeg(b"not a jpeg"))
+        # Already optimal: nothing to gain, nothing returned.
+        self.assertIsNone(lossless.optimize_jpeg(smaller))
 
     def test_same_pixels_detects_difference(self):
         one = jpeg_bytes(text_image(64, 64))

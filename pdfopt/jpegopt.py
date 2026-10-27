@@ -15,6 +15,7 @@ from functools import cache
 from io import BytesIO
 from pathlib import Path
 
+import mozjpeg_lossless_optimization
 import numpy as np
 import pikepdf
 from pikepdf import Name
@@ -96,10 +97,20 @@ def encode(bitmap: Image.Image, quality: int, *, progressive: bool = False) -> b
     return buffer.getvalue()
 
 
+def tighten(data: bytes) -> bytes:
+    """The same JPEG (same coefficients, so the same pixels) in fewer bytes:
+    mozjpeg's optimized Huffman tables and progressive scans."""
+    try:
+        smaller = mozjpeg_lossless_optimization.optimize(data)
+    except ValueError:
+        return data
+    return smaller if len(smaller) < len(data) else data
+
+
 def smallest_encoding(bitmap: Image.Image, quality: int, scratch: Path) -> bytes:
-    """Same pixels, fewest bytes: baseline vs progressive (and mozjpeg)."""
-    best = min(encode(bitmap, quality), encode(bitmap, quality, progressive=True),
-               key=len)
+    """Same pixels, fewest bytes: libjpeg's coefficients with mozjpeg's
+    entropy coding (and mozjpeg's own encoder, if installed)."""
+    best = tighten(encode(bitmap, quality))
     moz = _mozjpeg()
     if moz is not None:
         source = scratch / ("moz.ppm" if bitmap.mode == "RGB" else "moz.pgm")

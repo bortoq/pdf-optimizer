@@ -19,6 +19,12 @@ static PyObject *ect_deflate(PyObject *, PyObject *args)
   unsigned mode = 9;
   if (!PyArg_ParseTuple(args, "y*|I", &input, &mode))
     return nullptr;
+  // Mode 1 never returns (seen on a 2 MB image band); higher than 9 is undefined.
+  if (mode < 2 || mode > 9) {
+    PyBuffer_Release(&input);
+    PyErr_SetString(PyExc_ValueError, "ECT mode must be 2..9");
+    return nullptr;
+  }
   if (input.len == 0) {
     PyBuffer_Release(&input);
     return PyBytes_FromStringAndSize("\x03\x00", 2);
@@ -56,7 +62,7 @@ static PyObject *ect_deflate(PyObject *, PyObject *args)
 
 static PyMethodDef methods[] = {
   {"deflate", ect_deflate, METH_VARARGS,
-   "deflate(data, mode=9) -> raw Deflate stream compressed like `ect -<mode>`"},
+   "deflate(data, mode=9) -> raw Deflate stream compressed like `ect -<mode>` (mode 2..9)"},
   {nullptr, nullptr, 0, nullptr}
 };
 

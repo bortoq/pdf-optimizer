@@ -346,7 +346,7 @@ def _foreground(rgb: np.ndarray, ink: np.ndarray, dpi: float) -> Foreground:
     mean = np.stack(planes, axis=2) / np.maximum(weight, 1e-4)[:, :, None]
     mean[weight < 1e-3] = np.array(color) * 255
     image = Image.fromarray(mean.clip(0, 255).astype(np.uint8), "RGB")
-    data = jpegopt.encode(image, 60)
+    data = jpegopt.tighten(jpegopt.encode(image, 60))
     with Image.open(BytesIO(data)) as decoded:
         tint = decoded.convert("RGB")
     return Foreground([(color, ink)], image=(data, grid), tint=tint)
@@ -475,7 +475,7 @@ def _background_search(page: _Page, bitmap: Image.Image, dpi: float,
         found = _best_jpeg(page, background)
         if found is None:
             return None
-        candidates = [(found[1], "/DCTDecode")]
+        candidates = [(jpegopt.tighten(found[1]), "/DCTDecode")]
         for rate in JPX_RATES:
             data = _jpx(background, rate, scratch)
             if data is None:

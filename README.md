@@ -10,7 +10,7 @@
 ## Установка
 
 ```sh
-pip install -e .            # pikepdf, pypdf, Pillow, numpy + сборка модуля ECT
+pip install -e .            # pikepdf, pypdf, Pillow, numpy, fontTools, mozjpeg + сборка ECT
 pip install -e '.[dev]'     # + pytest, ruff
 ```
 
@@ -54,11 +54,18 @@ python3 -m pdfopt --help
    1-битными; Flate-картинки получают лучший PNG-предиктор; 1-битные Flate и
    CCITT Group 4 переписываются в **JBIG2 generic** (без потерь, обычно на
    30–50 % меньше G4);
-3. JPEG: `jpegtran` (оптимизированные таблицы Хаффмана, progressive) с проверкой
-   идентичности пикселей;
-4. потоки пересжимаются встроенным компрессором ECT (как `ect -9`, исходники
-   в `pdfopt/_ect`), затем сохраняются как object/xref streams
-   (qpdf внутри pikepdf).
+3. JPEG: `jpegtran` из mozjpeg (оптимизированные таблицы Хаффмана, подобранные
+   прогрессивные сканы; пакет `mozjpeg-lossless-optimization`) с проверкой
+   идентичности пикселей — на 0,7–28 % меньше `jpegtran` из libjpeg;
+4. встроенные шрифты TrueType урезаются до глифов, которые документ показывает
+   (fontTools; номера глифов сохраняются, content stream не меняется): Office
+   часто встраивает шрифт целиком — 329 КБ Calibri ради нескольких символов.
+   Страницы с изменёнными шрифтами сверяются попиксельно; при AcroForm и любой
+   неясности в использовании шрифта он не трогается;
+5. потоки пересжимаются встроенным компрессором ECT (как `ect -9`; потоки больше
+   4 МБ — как `ect -6`, в 4–8 раз быстрее и на 0,03–0,3 % крупнее; исходники в
+   `pdfopt/_ect`), затем сохраняются как object/xref streams (qpdf внутри
+   pikepdf).
 
 Метаданные, текстовый слой, геометрия и аннотации не меняются.
 
@@ -125,7 +132,6 @@ SSIM считается в процессе (numpy) по формуле FFmpeg `
 | Программа | Нужна для | Без неё |
 | --- | --- | --- |
 | `pdftoppm` (poppler) | проверка отрисовки, **обязательна для `-q`** | в lossless преобразования картинок отключаются; `-q` недоступен |
-| `jpegtran` | lossless-перепаковка JPEG | JPEG не трогаются |
 | `jbig2` (jbig2enc) | JBIG2: generic в lossless, символьные словари в MRC | Group 4/Flate |
 | `opj_compress` (OpenJPEG) | JPEG 2000 фон в MRC | только JPEG |
 | `cjpeg` из mozjpeg | более плотный JPEG | Pillow/libjpeg |
@@ -161,7 +167,7 @@ python -m unittest discover -s tests -t .   # или: pytest
 ruff check .
 ```
 
-Тесты, которым нужны `pdftoppm`, `jpegtran`, `jbig2`, `ffmpeg`, пропускаются,
+Тесты, которым нужны `pdftoppm`, `jbig2`, `ffmpeg`, `gs`, пропускаются,
 если программы не установлены.
 
 ## Лицензия
