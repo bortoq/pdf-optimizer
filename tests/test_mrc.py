@@ -131,6 +131,41 @@ class ForegroundTests(unittest.TestCase):
         self.assertLess(fg.image[1][0], 200)
 
 
+class CompositeTests(unittest.TestCase):
+    def page(self, ink_colour=(0, 0, 0)):
+        bitmap = text_image(ink=ink_colour)
+        ink = mrc.ink_mask(gray(bitmap), 200)
+        fg = mrc._foreground(np.asarray(bitmap), ink, 200)
+        return mrc._Page(bitmap, ink, fg, 100, 0.9)
+
+    def reference(self, page, background):
+        base = np.asarray(background.resize(page.view, Image.Resampling.NEAREST),
+                          dtype=np.float32)
+        if base.ndim == 2:
+            base = base[:, :, None]
+        out = base * (1 - page.coverage) + page._tint(base.shape[2]) * page.coverage
+        out = out.clip(0, 255).astype(np.uint8)
+        return out[:, :, 0] if out.shape[2] == 1 else out
+
+    def test_matches_the_plain_formula_for_gray_and_colour(self):
+        page = self.page()
+        for mode in ("L", "RGB"):
+            background = page.bitmap.convert(mode)
+            for _ in range(2):   # the second call uses the cached ink layer
+                self.assertTrue(np.array_equal(page.composite(background),
+                                               self.reference(page, background)))
+
+    def test_float_background_is_not_modified(self):
+        page = self.page()
+        values = np.full(page.bitmap.size[::-1], 200, dtype=np.float32)
+        values.flags.writeable = False
+        background = Image.fromarray(values, "F")
+        out = page.composite(background)
+        self.assertEqual(out.dtype, np.uint8)
+        self.assertEqual(out.shape, page.view[::-1])
+        self.assertTrue(np.all(values == 200))
+
+
 class StencilTests(unittest.TestCase):
     def test_group4_is_chosen_for_text_and_decodes_back(self):
         bitmap = text_image(600, 800)

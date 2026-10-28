@@ -410,8 +410,10 @@ class _Page:
             self.tint = np.array(fg.inks[0][0], dtype=np.float32) * 255
 
     def composite(self, background: Image.Image) -> np.ndarray:
-        base = np.asarray(background.resize(self.view, Image.Resampling.NEAREST),
-                          dtype=np.float32)
+        # A copy: the blending below is in place, and for a float image
+        # np.asarray would give a read-only view.
+        base = np.array(background.resize(self.view, Image.Resampling.NEAREST),
+                        dtype=np.float32)
         if base.ndim == 2:
             base = base[:, :, None]
         channels = base.shape[2]
@@ -443,6 +445,10 @@ class _Page:
         return True
 
     def _tint(self, channels: int):
+        """Ink colour for a background with this many channels.
+
+        Must depend only on ``channels``: composite() caches the result.
+        """
         if channels == 1 and isinstance(self.tint, np.ndarray) and self.tint.ndim == 3:
             return self.tint.mean(axis=2, keepdims=True)
         if channels == 1:
