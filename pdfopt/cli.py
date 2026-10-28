@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import shutil
+import signal
 import sys
 import time
 
@@ -129,9 +130,20 @@ def files_at_once(cores: int, files: int, mode: str,
 _PROGRESS = None   # in a worker process: the queue that carries progress to the parent
 
 
+class _Interrupted(BaseException):
+    """Ctrl+C reached a worker; unwinds it quietly (temporary files are removed)."""
+
+
+def _stop(signum, frame) -> None:
+    raise _Interrupted
+
+
 def _init_worker(channel) -> None:
     global _PROGRESS
     _PROGRESS = channel
+    # The terminal sends Ctrl+C to every process; the parent reports it, the
+    # workers just stop. Programs started by a worker get the default action.
+    signal.signal(signal.SIGINT, _stop)
 
 
 def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None]:
@@ -174,6 +186,10 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None]:
         scores = getattr(outcome, "scores", ())
         quality = (len(scores), sum(scores), min(scores)) if scores else None
         return str(path), "ok", saved, status, quality
+    except (KeyboardInterrupt, _Interrupted):
+        if work != path:
+            work.unlink(missing_ok=True)
+        return str(path), "interrupted", 0, "interrupted", None
     except Skipped as exc:
         return str(path), "skipped", 0, f"skipped: {exc}", None
     except (OSError, ValueError) as exc:
@@ -293,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     fractions: dict[str, float] = dict.fromkeys(sizes, 0.0)
     bar = None if args.verbose or not sys.stderr.isatty() else _Bar(len(paths))
     current = ""
+    interrupted: list[str] = []
 
     def overall() -> float:
         return sum(sizes[name] * value for name, value in fractions.items()) / weight
@@ -308,6 +325,9 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal failures, skipped, known, total_saved, done_size, done
         nonlocal pages, ssim_sum, lowest
         name, outcome, saved, text, quality = result
+        if outcome == "interrupted":
+            interrupted.append(name)
+            return
         done += 1
         done_size += sizes[name]
         total_saved += saved
@@ -331,23 +351,44 @@ def main(argv: list[str] | None = None) -> int:
 
     if bar:
         bar.draw(0.0, 0, 0, 0, "", force=True)
-    if parallel > 1:
-        channel = multiprocessing.Queue()
-        with ProcessPoolExecutor(max_workers=parallel, initializer=_init_worker,
-                                 initargs=(channel,)) as pool:
-            running = {pool.submit(_process, task) for task in tasks}
-            while running:
-                finished, running = wait(running, timeout=0.1, return_when=FIRST_COMPLETED)
+    try:
+        if parallel > 1:
+            channel = multiprocessing.Queue()
+            with ProcessPoolExecutor(max_workers=parallel, initializer=_init_worker,
+                                     initargs=(channel,)) as pool:
+                running = {pool.submit(_process, task) for task in tasks}
                 try:
-                    while True:
-                        progress(*channel.get_nowait())
-                except queue.Empty:
-                    pass
-                for future in finished:
-                    report(future.result())
-    else:
-        for task in tasks:
-            report(_process(task, progress))
+                    while running:
+                        finished, running = wait(running, timeout=0.1,
+                                                 return_when=FIRST_COMPLETED)
+                        try:
+                            while True:
+                                progress(*channel.get_nowait())
+                        except queue.Empty:
+                            pass
+                        for future in finished:
+                            report(future.result())
+                        if interrupted:     # a worker was stopped: stop the rest
+                            raise KeyboardInterrupt
+                except KeyboardInterrupt:
+                    for future in running:
+                        future.cancel()
+                    # Workers were stopped by the same Ctrl+C; collect them.
+                    for future in wait(running)[0]:
+                        if not future.cancelled():
+                            report(future.result())
+                    raise
+        else:
+            for task in tasks:
+                report(_process(task, progress))
+                if interrupted:
+                    raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        if bar:
+            bar.clear()
+        print(f"pdfopt: interrupted, {done} of {len(paths)} files "
+              "finished; the others are unchanged", file=sys.stderr)
+        return 130
     if bar:
         bar.clear()
     print(f"Saved: {_human(total_saved)} ({_percent(total_saved, done_size)})" +

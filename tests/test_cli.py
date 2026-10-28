@@ -299,3 +299,27 @@ class DiscoverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterruptTests(unittest.TestCase):
+    def test_ctrl_c_stops_quietly_and_leaves_the_file_alone(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            make_text_pdf(book)
+            original = book.read_bytes()
+            with patch("pdfopt.cli.optimize_pdf", side_effect=KeyboardInterrupt):
+                code, _, err = run(book)
+            self.assertEqual(code, 130)
+            self.assertIn("interrupted", err)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(book.read_bytes(), original)
+
+    def test_interrupted_copy_for_output_is_removed(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            make_text_pdf(book)
+            target = Path(root) / "out.pdf"
+            with patch("pdfopt.cli.optimize_pdf", side_effect=KeyboardInterrupt):
+                code, _, _ = run("-o", target, book)
+            self.assertEqual(code, 130)
+            self.assertFalse(target.exists())
