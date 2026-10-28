@@ -35,7 +35,8 @@ SSIM 0.962, against 655 KB / 0.880 for DjVu (`pdf2djvu --lossy`).
 ## Install
 
 ```sh
-pip install -e .            # pikepdf, pypdf, Pillow, numpy, fontTools, mozjpeg + builds ECT
+pip install git+https://github.com/bortoq/pdf-optimizer.git   # straight from GitHub
+pip install -e .            # from a checkout: pikepdf, pypdf, Pillow, numpy, fontTools, mozjpeg + builds ECT
 pip install -e '.[dev]'     # + pytest, ruff
 ```
 
