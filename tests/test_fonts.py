@@ -65,6 +65,18 @@ class SubsetTests(unittest.TestCase):
             # "Z" (g025) is shown only by the annotation.
             self.assertEqual(outlines(program(path)), {".notdef", "g000", "g001", "g025"})
 
+    def test_mac_only_cmap_survives_the_cut(self):
+        # LibreOffice fonts: no /Encoding, one (1, 0) cmap table.
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "f.pdf"
+            make_font_pdf(path, kind="simple", text="ABAC", mac_only=True)
+            before = path.stat().st_size
+            self.assertEqual(cut(path)[1], 1)
+            tt = program(path)
+            self.assertEqual([(t.platformID, t.platEncID) for t in tt["cmap"].tables], [(1, 0)])
+            self.assertEqual(sorted(tt["cmap"].tables[0].cmap), [0x41, 0x42, 0x43])
+            self.assertLess(path.stat().st_size, before / 2)
+
     def test_fonts_are_left_alone_when_use_is_unclear(self):
         cases = {"acroform": {"acroform": True},
                  "orphan user": {"orphan_user": True},
@@ -88,11 +100,11 @@ class SubsetTests(unittest.TestCase):
 @unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
 class LosslessBuildTests(unittest.TestCase):
     def test_build_cuts_fonts_and_renders_the_same(self):
-        for kind in ("simple", "cid"):
-            with self.subTest(kind), tempfile.TemporaryDirectory() as root:
+        for kind, mac_only in (("simple", False), ("cid", False), ("simple", True)):
+            with self.subTest(kind, mac_only=mac_only), tempfile.TemporaryDirectory() as root:
                 scratch = Path(root)
                 source = scratch / "f.pdf"
-                make_font_pdf(source, kind=kind, annotation=True)
+                make_font_pdf(source, kind=kind, annotation=True, mac_only=mac_only)
                 target = scratch / "out.pdf"
                 report = lossless.build(source, target, scratch, jobs=1)
                 self.assertIn("fonts×1", report.notes)

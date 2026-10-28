@@ -429,7 +429,7 @@ def save(pdf: pikepdf.Pdf, target: Path, *, deflated: bool) -> None:
 
 def build(source: Path, target: Path, scratch: Path, jobs: int = 1, *,
           transforms: bool = True, jbig2: bool = True,
-          ect: bool = True) -> Report:
+          ect: bool = True, cut_fonts: bool = True) -> Report:
     """Run the whole lossless pipeline from ``source`` into ``target``."""
     notes: list[str] = []
     with open_pdf(source) as pdf:
@@ -440,7 +440,7 @@ def build(source: Path, target: Path, scratch: Path, jobs: int = 1, *,
         visual, counts = optimize_images(pdf, scratch, jobs,
                                          transforms=transforms, jbig2=jbig2)
         notes.extend(f"{name}×{count}" for name, count in sorted(counts.items()))
-        if transforms:
+        if transforms and cut_fonts:
             font_pages, cut = fonts.subset_fonts(pdf)
             if cut:
                 visual |= font_pages

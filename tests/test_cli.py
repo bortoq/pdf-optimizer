@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pikepdf
 
-from pdfopt.cli import discover, main
+from pdfopt.cli import discover, files_at_once, main
 
 from .helpers import make_text_pdf, sign
 
@@ -142,11 +142,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("--safe-text", out)
         self.assertIn("--mrc-quality", out)
-        for removed in ("--jobs", "--fast", "--version", "--pdf-worker"):
+        for option in ("--jobs", "--version", "--output"):
+            self.assertIn(option, out)
+        for removed in ("--fast", "--pdf-worker"):
             self.assertNotIn(removed, out)
 
     def test_removed_options_are_rejected(self):
-        for option in ("-j", "--fast", "--version", "--pdf-worker"):
+        for option in ("--fast", "--pdf-worker"):
             self.assertEqual(run(option, "x.pdf")[0], 2, option)
 
     def test_missing_worker_is_only_a_warning(self):
@@ -183,6 +185,73 @@ class CliTests(unittest.TestCase):
             run(book)
             self.assertIn("уже оптимизирован", run("-v", book)[1])
             self.assertNotIn("уже оптимизирован", run("-v", "--force", book)[1])
+
+
+class OptionTests(unittest.TestCase):
+    def test_version(self):
+        code, out, _ = run("--version")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"^pdfopt \d+\.\d+\.\d+")
+
+    def test_output_file_leaves_the_source_alone(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            plain_pdf(book)
+            original = book.read_bytes()
+            target = Path(root) / "out" / "small.pdf"
+            self.assertEqual(run("-o", target, book)[0], 0)
+            self.assertEqual(book.read_bytes(), original)
+            self.assertLess(target.stat().st_size, len(original))
+
+    def test_output_directory_for_several_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name in ("a.pdf", "b.pdf"):
+                plain_pdf(Path(root) / name)
+            target = Path(root) / "out"
+            self.assertEqual(run("-o", target, Path(root) / "a.pdf", Path(root) / "b.pdf")[0], 0)
+            self.assertEqual(sorted(p.name for p in target.iterdir()), ["a.pdf", "b.pdf"])
+
+    def test_output_errors(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            plain_pdf(base / "a.pdf")
+            plain_pdf(base / "b.pdf")
+            (base / "file.pdf").write_bytes(b"x")
+            self.assertEqual(run("-o", base / "a.pdf", base / "a.pdf")[0], 2)
+            self.assertEqual(run("-o", base / "file.pdf", base / "a.pdf", base / "b.pdf")[0], 2)
+
+    def test_output_removed_when_the_file_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            bad = Path(root) / "bad.pdf"
+            bad.write_bytes(b"not a pdf")
+            target = Path(root) / "o.pdf"
+            self.assertEqual(run("-o", target, bad)[0], 1)
+            self.assertFalse(target.exists())
+
+    def test_jobs_must_be_positive(self):
+        self.assertEqual(run("-j", "0", "x.pdf")[0], 2)
+
+    def test_symlink_argument_is_explained(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            plain_pdf(base / "a.pdf")
+            (base / "link.pdf").symlink_to(base / "a.pdf")
+            code, _, err = run(base / "link.pdf")
+            self.assertEqual(code, 2)
+            self.assertIn("символьная ссылка", err)
+
+    def test_already_optimized_files_are_counted_without_verbose(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            plain_pdf(book)
+            run(book)
+            self.assertIn("уже оптимизировано: 1", run(book)[1])
+
+    def test_parallel_files_are_bounded_by_memory(self):
+        self.assertEqual(files_at_once(8, 10, "lossy", available_mb=1500), 2)
+        self.assertEqual(files_at_once(8, 10, "lossless", available_mb=100000), 8)
+        self.assertEqual(files_at_once(8, 3, "lossy", available_mb=100), 1)
+        self.assertEqual(files_at_once(8, 3, "lossy", available_mb=None) >= 1, True)
 
 
 class DiscoverTests(unittest.TestCase):

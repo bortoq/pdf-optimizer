@@ -215,7 +215,7 @@ def sign(path: Path) -> None:
         pdf.save(path)
 
 
-def truetype_font(glyphs: int = 200) -> bytes:
+def truetype_font(glyphs: int = 200, *, mac_only: bool = False) -> bytes:
     """A TrueType font with ``glyphs`` distinct, detailed glyphs mapped from
     U+0041 on (so cutting unused glyphs is measurable)."""
     from fontTools.fontBuilder import FontBuilder
@@ -239,6 +239,12 @@ def truetype_font(glyphs: int = 200) -> bytes:
     builder = FontBuilder(1000, isTTF=True)
     builder.setupGlyphOrder(names)
     builder.setupCharacterMap({0x41 + i: f"g{i:03d}" for i in range(glyphs)})
+    if mac_only:   # as LibreOffice writes it: only a (1, 0) table, code -> glyph
+        from fontTools.ttLib.tables._c_m_a_p import cmap_format_0
+        table = cmap_format_0(0)
+        table.platformID, table.platEncID, table.language = 1, 0, 0
+        table.cmap = {0x41 + i: f"g{i:03d}" for i in range(min(glyphs, 190))}
+        builder.font["cmap"].tables = [table]
     builder.setupGlyf(outlines)
     builder.setupHorizontalMetrics(dict.fromkeys(names, (700, 50)))
     builder.setupHorizontalHeader(ascent=800, descent=-200)
@@ -252,7 +258,8 @@ def truetype_font(glyphs: int = 200) -> bytes:
 
 def make_font_pdf(path: Path, *, kind: str = "simple", text: str = "ABAC",
                   in_form: bool = False, annotation: bool = False, acroform: bool = False,
-                  orphan_user: bool = False, encoding: str = "/Identity-H") -> None:
+                  orphan_user: bool = False, encoding: str = "/Identity-H",
+                  mac_only: bool = False) -> None:
     """A page showing ``text`` with an embedded TrueType font.
 
     kind: "simple" (WinAnsi TrueType) or "cid" (Type0/CIDFontType2, codes =
@@ -262,7 +269,7 @@ def make_font_pdf(path: Path, *, kind: str = "simple", text: str = "ABAC",
     """
     import zlib
     pdf = Pdf.new()
-    data = truetype_font()
+    data = truetype_font(mac_only=mac_only)
     program = pdf.make_stream(zlib.compress(data, 9))
     program.Filter, program.Length1 = Name.FlateDecode, len(data)
     descriptor = pdf.make_indirect(Dictionary(
@@ -273,6 +280,8 @@ def make_font_pdf(path: Path, *, kind: str = "simple", text: str = "ABAC",
         font = Dictionary(Type=Name.Font, Subtype=Name.TrueType, BaseFont=Name("/PdfoptTest"),
                           FirstChar=32, LastChar=255, Widths=[700] * 224,
                           Encoding=Name.WinAnsiEncoding, FontDescriptor=descriptor)
+        if mac_only:
+            del font["/Encoding"]
         shown = pikepdf.String(text.encode("cp1252"))
     else:
         cid = Dictionary(Type=Name.Font, Subtype=Name.CIDFontType2,

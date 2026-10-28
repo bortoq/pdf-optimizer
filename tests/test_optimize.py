@@ -14,6 +14,7 @@ from pdfopt.tools import ToolError
 
 from .helpers import (
     make_flate_image_pdf,
+    make_font_pdf,
     make_scan_pdf,
     make_soft_scan_pdf,
     make_text_pdf,
@@ -151,6 +152,18 @@ class FallbackTests(unittest.TestCase):
                 self.assertEqual(str(pdf.pages[0].Resources.XObject.Im0.ColorSpace),
                                  "/DeviceRGB")
             self.assertEqual(book.stat().st_size, before - saved)
+
+
+class FontFallbackTests(unittest.TestCase):
+    def test_a_bad_font_cut_does_not_cost_the_image_rewrites(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "f.pdf"
+            make_font_pdf(path)
+            # The first (font-cutting) build "renders differently".
+            with patch("pdfopt.optimize.identical_pages", side_effect=[False, True]):
+                status, saved = optimize_pdf(path, "lossless", jobs=1)
+            self.assertIn("lossless-nofonts", status)
+            self.assertGreater(saved, 0)
 
 
 class WorkerTests(unittest.TestCase):

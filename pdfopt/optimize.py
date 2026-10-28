@@ -109,6 +109,9 @@ def _make_ghostscript(source: Path, target: Path, dpi: int, qfactor: float) -> N
 
 # ----------------------------------------------------------- orchestration --
 
+ALREADY = "уже оптимизирован"
+
+
 class _Run:
     """State of one optimize_pdf call."""
 
@@ -147,12 +150,17 @@ class _Run:
 
     def lossless_stage(self) -> Candidate | None:
         """Build and verify the pure lossless result (also the lossy base)."""
+        cut = True
         for label, options in (("lossless", {}),
+                               ("lossless-nofonts", {"cut_fonts": False}),
                                ("lossless-safe", {"transforms": False})):
+            if label == "lossless-nofonts" and not cut:
+                continue        # fonts were not the cause: the next try drops more
             work = self.directory(label)
             target = work / "out.pdf"
             try:
                 report = lossless.build(self.path, target, work, self.jobs, **options)
+                cut = any(note.startswith("fonts") for note in report.notes)
                 candidate = Candidate(label, target, target.stat().st_size,
                                       exact_pages=[p + 1 for p in sorted(report.visual_pages)],
                                       content=True, metadata=True)
@@ -362,7 +370,7 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
         baseline = Fingerprint.read(pdf, work)
     lossy = mode == "lossy"
     if not force and marker and marker[0] >= MARKER_VERSION and (marker[1] or not lossy):
-        return "уже оптимизирован", 0
+        return ALREADY, 0
     worker = find_worker()
     if lossy and which("pdftoppm") is None:
         raise ValueError("PDF: для проверки результата нужен pdftoppm")

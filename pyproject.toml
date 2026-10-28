@@ -20,12 +20,17 @@ dependencies = [
     "fonttools>=4.50,<5",                         # subsetting embedded TrueType fonts
     "mozjpeg-lossless-optimization>=1.3,<2",      # lossless JPEG scan optimization
 ]
+keywords = ["pdf", "compress", "optimize", "scan", "mrc", "jbig2"]
 classifiers = [
     "Environment :: Console",
     "Programming Language :: Python :: 3",
     "Topic :: Multimedia :: Graphics :: Graphics Conversion",
     "Topic :: Utilities",
 ]
+
+[project.urls]
+Homepage = "https://github.com/bortoq/pdf-optimizer"
+Issues = "https://github.com/bortoq/pdf-optimizer/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]
@@ -37,6 +42,9 @@ pdfopt = "pdfopt.cli:main"
 # MANIFEST.in puts the ECT sources into the sdist; the wheel only needs the
 # built module (the licenses go to dist-info via license-files).
 include-package-data = false
+
+[tool.setuptools.package-data]
+pdfopt = ["py.typed"]
 
 [tool.setuptools.packages.find]
 include = ["pdfopt*"]

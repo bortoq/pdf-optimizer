@@ -22,6 +22,7 @@ import logging
 import zlib
 
 from fontTools import subset as ftsubset
+from fontTools import ttLib
 from fontTools.agl import toUnicode
 from fontTools.ttLib import TTFont
 import pikepdf
@@ -205,8 +206,32 @@ def _glyphs(font, codes: set[int], tt: TTFont) -> set[int]:
     return gids
 
 
+def _restore_cmap(tt: TTFont, tables) -> None:
+    from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
+    if "cmap" not in tt:
+        tt["cmap"] = ttLib.newTable("cmap")
+        tt["cmap"].tableVersion = 0
+    cmap = tt["cmap"]
+    cmap.tables = []
+    for platform, encoding_id, format_, language, entries in tables:
+        if not entries or (format_ == 0 and max(entries) > 255):
+            continue
+        table = CmapSubtable.newSubtable(format_)
+        table.platformID, table.platEncID, table.language = platform, encoding_id, language
+        table.cmap = entries
+        cmap.tables.append(table)
+
+
 def _subset(data: bytes, gids: set[int]) -> bytes:
     tt = TTFont(io.BytesIO(data))
+    order = tt.getGlyphOrder()
+    kept = {order[g] for g in gids if g < len(order)}
+    # The subsetter keeps only the cmap entries of requested Unicode values and
+    # empties tables such as the (1, 0) one of LibreOffice fonts, which maps
+    # codes straight to glyphs; viewers then lose the way from code to glyph.
+    tables = [(t.platformID, t.platEncID, t.format, t.language,
+               {code: name for code, name in t.cmap.items() if name in kept})
+              for t in tt["cmap"].tables] if "cmap" in tt else []
     options = ftsubset.Options()
     options.retain_gids = True           # content streams keep their codes
     options.glyph_names = True
@@ -221,6 +246,8 @@ def _subset(data: bytes, gids: set[int]) -> bytes:
     subsetter = ftsubset.Subsetter(options)
     subsetter.populate(gids=sorted(gids))
     subsetter.subset(tt)
+    if tables:
+        _restore_cmap(tt, tables)
     output = io.BytesIO()
     tt.save(output)
     return output.getvalue()
