@@ -401,6 +401,8 @@ class _Page:
         self.reference = jpegopt.view_of(bitmap, self.view)
         self.coverage = (np.asarray(self.ink.resize(self.view, Image.Resampling.BOX),
                                     dtype=np.float32) / 255)[:, :, None]
+        self.keep = 1 - self.coverage
+        self._paint: dict[int, np.ndarray] = {}
         if fg.tint is not None:
             tint = fg.tint.resize(self.view, Image.Resampling.NEAREST)
             self.tint = np.asarray(tint, dtype=np.float32)
@@ -412,8 +414,12 @@ class _Page:
                           dtype=np.float32)
         if base.ndim == 2:
             base = base[:, :, None]
-        out = base * (1 - self.coverage) + self._tint(base.shape[2]) * self.coverage
-        out = out.clip(0, 255).astype(np.uint8)
+        channels = base.shape[2]
+        if channels not in self._paint:   # the same for every probe of this page
+            self._paint[channels] = self._tint(channels) * self.coverage
+        base *= self.keep
+        base += self._paint[channels]
+        out = base.clip(0, 255).astype(np.uint8)
         return out[:, :, 0] if out.shape[2] == 1 else out
 
     def score(self, decoded: Image.Image) -> float:

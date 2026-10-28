@@ -36,11 +36,16 @@ def _load(path: Path) -> np.ndarray:
         return np.asarray(image.convert("RGB"))
 
 
-def _runs(pages: list[int]) -> list[list[int]]:
-    """Group sorted page numbers into consecutive runs of at most CHUNK."""
+def _runs(pages: list[int], jobs: int = 1) -> list[list[int]]:
+    """Group sorted page numbers into consecutive runs.
+
+    Runs hold at most CHUNK pages, fewer when that would leave cores idle
+    (pdftoppm renders one page at a time, so a run is one core's work).
+    """
+    size = max(1, min(CHUNK, -(-len(pages) // max(1, jobs))))
     runs: list[list[int]] = []
     for page in sorted(pages):
-        if runs and page == runs[-1][-1] + 1 and len(runs[-1]) < CHUNK:
+        if runs and page == runs[-1][-1] + 1 and len(runs[-1]) < size:
             runs[-1].append(page)
         else:
             runs.append([page])
@@ -77,7 +82,7 @@ class VisualGate:
                 self.reference[page] = file
 
         with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-            list(pool.map(work, _runs(todo)))
+            list(pool.map(work, _runs(todo, self.jobs)))
 
     def failures(self, candidate: Path, pages: list[int], *, stop_early: bool = False,
                  minimum: float | None = None) -> list[int]:
@@ -110,7 +115,7 @@ class VisualGate:
 
         try:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-                for failed in pool.map(work, _runs(pages)):
+                for failed in pool.map(work, _runs(pages, self.jobs)):
                     bad.extend(failed)
         finally:
             shutil.rmtree(base, ignore_errors=True)
@@ -142,6 +147,6 @@ def identical_pages(first: Path, second: Path, pages: list[int], scratch: Path,
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-            return all(pool.map(work, _runs(pages)))
+            return all(pool.map(work, _runs(pages, jobs)))
     finally:
         shutil.rmtree(base, ignore_errors=True)
