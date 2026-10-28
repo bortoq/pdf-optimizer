@@ -29,8 +29,10 @@ python3 -m pdfopt --help
 least one file failed, `2` bad arguments, or nothing to do because every path
 named was rejected (a symlink, not a `.pdf`).
 
-Without `-v` a terminal shows one progress line with the share saved so far,
-and a single total at the end. Signed PDFs and password-protected files are
+Without `-v` a terminal shows one progress line (share of the work done, files
+done, the saving so far), and a single total at the end. With `-q` the total also
+shows the mean SSIM of the new pages against the sources and the lowest page,
+for example `Saved: 281.0 MB (87.1%) SSIM 0.9983 (lowest page 0.9712)`. Signed PDFs and password-protected files are
 **skipped** (`skipped: ...`), which is not an error; files encrypted without a
 password are processed only with `--decrypt`. Already optimized files are
 counted in the total. When several files run at once, their number is bounded

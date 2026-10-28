@@ -19,6 +19,7 @@ import io
 from pathlib import Path
 import struct
 import tempfile
+import threading
 import zlib
 
 import mozjpeg_lossless_optimization
@@ -29,6 +30,7 @@ from PIL import Image
 
 from . import fonts, imagedata
 from .pdfmodel import collect_images, filters_of, iter_streams, open_pdf
+from .progress import Callback, nothing
 from .tools import ToolError, run, which
 
 try:   # the bundled ECT compressor (build: python setup.py build_ext --inplace)
@@ -309,7 +311,8 @@ def _apply(obj, result: Replacement) -> None:
 
 
 def optimize_images(pdf: pikepdf.Pdf, scratch: Path, jobs: int, *,
-                    transforms: bool, jbig2: bool) -> tuple[set[int], Counter]:
+                    transforms: bool, jbig2: bool,
+                    progress: Callback = nothing) -> tuple[set[int], Counter]:
     """Rewrite images in place.
 
     Returns the pages that need a visual check and a count of rewrites by kind.
@@ -356,6 +359,7 @@ def optimize_images(pdf: pikepdf.Pdf, scratch: Path, jobs: int, *,
                     counts[result.note] += 1
                     if kind == "raw":
                         visual.update(pages)
+            progress(min(1.0, (start + window) / len(entries)))
     return visual, counts
 
 
@@ -377,7 +381,7 @@ def deflate_zlib(data: bytes, mode: int = 9) -> bytes:
             struct.pack(">I", zlib.adler32(data)))
 
 
-def ect_streams(pdf: pikepdf.Pdf, jobs: int) -> bool:
+def ect_streams(pdf: pikepdf.Pdf, jobs: int, progress: Callback = nothing) -> bool:
     """Re-deflate Flate/unfiltered streams with ECT; True if it ran."""
     if _ectdeflate is None:
         return False
@@ -405,8 +409,18 @@ def ect_streams(pdf: pikepdf.Pdf, jobs: int) -> bool:
         budget -= len(data)
         items.append((stream, data, len(raw) if filters else None))
 
+    # Progress counts bytes: one big stream may take most of the time.
+    total = sum(len(item[1]) for item in items) or 1
+    lock = threading.Lock()
+    done = [0]
+
     def pack(item):
-        return deflate_zlib(item[1], ect_mode(len(item[1])))
+        packed = deflate_zlib(item[1], ect_mode(len(item[1])))
+        with lock:
+            done[0] += len(item[1])
+            fraction = done[0] / total
+        progress(fraction)
+        return packed
 
     # The compressor releases the GIL, so threads scale across cores.
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
@@ -429,22 +443,30 @@ def save(pdf: pikepdf.Pdf, target: Path, *, deflated: bool) -> None:
 
 def build(source: Path, target: Path, scratch: Path, jobs: int = 1, *,
           transforms: bool = True, jbig2: bool = True,
-          ect: bool = True, cut_fonts: bool = True) -> Report:
-    """Run the whole lossless pipeline from ``source`` into ``target``."""
+          ect: bool = True, cut_fonts: bool = True,
+          progress: Callback = nothing) -> Report:
+    """Run the whole lossless pipeline from ``source`` into ``target``.
+
+    ``progress`` gets the completed fraction (0..1) of this call.
+    """
     notes: list[str] = []
     with open_pdf(source) as pdf:
         if drop_thumbnails(pdf):
             notes.append("thumbs")
         if merge_identical_streams(pdf):
             notes.append("dedupe")
+        progress(0.05)
         visual, counts = optimize_images(pdf, scratch, jobs,
-                                         transforms=transforms, jbig2=jbig2)
+                                         transforms=transforms, jbig2=jbig2,
+                                         progress=lambda f: progress(0.05 + 0.45 * f))
         notes.extend(f"{name}×{count}" for name, count in sorted(counts.items()))
         if transforms and cut_fonts:
             font_pages, cut = fonts.subset_fonts(pdf)
             if cut:
                 visual |= font_pages
                 notes.append(f"fonts×{cut}")
-        deflated = ect_streams(pdf, jobs) if ect else False
+        progress(0.55)
+        deflated = ect_streams(pdf, jobs, lambda f: progress(0.55 + 0.35 * f)) if ect else False
+        progress(0.9)
         save(pdf, target, deflated=deflated)
     return Report(visual, notes)

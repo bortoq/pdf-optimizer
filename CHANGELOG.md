@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Interface**
+- The progress bar moves while a file is being processed (layering of scan
+  pages, rendering checks, ECT), not only when a file is finished. It shows the
+  share of the total work (weighted by file size), files done and the saving so
+  far. Works with several files at once (worker processes report to the parent).
+- With `-q` the total line shows the similarity of the new files to the sources:
+  `Saved: 281.0 MB (87.1%) SSIM 0.9983 (lowest page 0.9712)`. The mean is over
+  all pages of all changed files; each page is rendered once more at 200 dpi from
+  the file as it is written. `optimize_pdf` returns an `Outcome` (still unpacks as
+  `(status, saved)`) with the page `scores`.
+
 **Audit fixes**
 - Font cutting: the cmap tables are rebuilt after the subset. Fonts without
   `/Encoding` and with a single (1, 0) table (LibreOffice export) lost the way

@@ -23,6 +23,7 @@ from PIL import Image
 
 from . import imagedata
 from .pdfmodel import collect_images, filters_of, page_resources
+from .progress import Callback, nothing
 from .render import SSIM_DPI
 from .ssim import ssim
 from .tools import run, which
@@ -307,7 +308,7 @@ def _run(job: Job, minimum: float, scratch: Path):
 
 
 def optimize_jpegs(pdf: pikepdf.Pdf, scratch: Path, minimum: float,
-                   jobs: int) -> tuple[Counter, list[Change]]:
+                   jobs: int, progress: Callback = nothing) -> tuple[Counter, list[Change]]:
     """Re-encode eligible images in place.
 
     Returns counters for the log and one undoable ``Change`` per image.
@@ -343,4 +344,5 @@ def optimize_jpegs(pdf: pikepdf.Pdf, scratch: Path, minimum: float,
                 obj.BitsPerComponent = 8
                 counts["resized" if (width, height) != (job.width, job.height)
                        else "recoded"] += 1
+            progress(min(1.0, (start + window) / len(entries)))
     return counts, changes

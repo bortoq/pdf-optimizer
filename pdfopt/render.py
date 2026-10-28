@@ -9,6 +9,7 @@ import shutil
 import numpy as np
 from PIL import Image
 
+from .progress import Callback, Span, nothing
 from .ssim import ssim
 from .tools import ToolError, last_line, require, run
 
@@ -84,42 +85,53 @@ class VisualGate:
         with ThreadPoolExecutor(max_workers=self.jobs) as pool:
             list(pool.map(work, _runs(todo, self.jobs)))
 
-    def failures(self, candidate: Path, pages: list[int], *, stop_early: bool = False,
-                 minimum: float | None = None) -> list[int]:
-        """1-based pages whose SSIM against the source is below the minimum
-        (the gate's own unless ``minimum`` is given)."""
-        minimum = self.minimum if minimum is None else minimum
+    def scores(self, candidate: Path, pages: list[int], *, stop_below: float | None = None,
+               progress: Callback = nothing) -> dict[int, float]:
+        """SSIM of 1-based ``pages`` of the candidate against the source.
+
+        A page that cannot be compared scores 0. With ``stop_below`` the runs
+        that have not started when a page scores under it are left out.
+        ``progress`` gets the fraction of runs rendered.
+        """
         self.prepare(pages)
         self._counter += 1
-        bad: list[int] = []
+        found: dict[int, float] = {}
         base = self.dir / f"c{self._counter}"
+        runs = _runs(pages, self.jobs)
+        tick = Span(progress).counter(len(runs))
 
-        def work(run_pages: list[int]) -> list[int]:
-            if stop_early and bad:
-                return []
+        def work(run_pages: list[int]) -> None:
+            if stop_below is not None and any(v < stop_below for v in list(found.values())):
+                return
             files = render(candidate, run_pages[0], run_pages[-1], base,
                            f"p{run_pages[0]}", dpi=SSIM_DPI)
-            failed = []
             for page, file in zip(run_pages, files):
                 try:
                     result = _load(file)
                     original = _load(self.reference[page])
-                    ok = (result.shape == original.shape and
-                          ssim(original, result) >= minimum)
+                    found[page] = (ssim(original, result)
+                                   if result.shape == original.shape else 0.0)
                 except (OSError, ValueError):
-                    ok = False
-                if not ok:
-                    failed.append(page)
+                    found[page] = 0.0
                 file.unlink(missing_ok=True)
-            return failed
+            tick()
 
         try:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-                for failed in pool.map(work, _runs(pages, self.jobs)):
-                    bad.extend(failed)
+                list(pool.map(work, runs))
         finally:
             shutil.rmtree(base, ignore_errors=True)
-        return sorted(bad)
+        return found
+
+    def failures(self, candidate: Path, pages: list[int], *, stop_early: bool = False,
+                 minimum: float | None = None,
+                 progress: Callback = nothing) -> list[int]:
+        """1-based pages whose SSIM against the source is below the minimum
+        (the gate's own unless ``minimum`` is given)."""
+        minimum = self.minimum if minimum is None else minimum
+        found = self.scores(candidate, pages, progress=progress,
+                            stop_below=minimum if stop_early else None)
+        return sorted(page for page, value in found.items() if value < minimum)
 
     def score(self, candidate: Path, page: int) -> float:
         self.prepare([page])
@@ -131,9 +143,11 @@ class VisualGate:
 
 
 def identical_pages(first: Path, second: Path, pages: list[int], scratch: Path,
-                    jobs: int = 1) -> bool:
+                    jobs: int = 1, progress: Callback = nothing) -> bool:
     """True when the listed 1-based pages render pixel-for-pixel the same."""
     base = scratch / "exact"
+    runs = _runs(pages, jobs)
+    tick = Span(progress).counter(len(runs))
 
     def work(run_pages: list[int]) -> bool:
         a = render(first, run_pages[0], run_pages[-1], base / "a",
@@ -143,10 +157,11 @@ def identical_pages(first: Path, second: Path, pages: list[int], scratch: Path,
         same = all(np.array_equal(_load(x), _load(y)) for x, y in zip(a, b))
         for file in (*a, *b):
             file.unlink(missing_ok=True)
+        tick()
         return same
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-            return all(pool.map(work, _runs(pages, jobs)))
+            return all(pool.map(work, runs))
     finally:
         shutil.rmtree(base, ignore_errors=True)

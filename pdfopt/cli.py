@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+import multiprocessing
 import os
 from pathlib import Path
+import queue
 import shutil
 import sys
+import time
 
 from . import __version__
 from .lossless import ect_available
@@ -123,14 +126,37 @@ def files_at_once(cores: int, files: int, mode: str,
     return max(1, count)
 
 
-def _process(task) -> tuple[str, str, int, str]:
-    """Worker: returns (path, outcome, saved, text); never raises."""
+_PROGRESS = None   # in a worker process: the queue that carries progress to the parent
+
+
+def _init_worker(channel) -> None:
+    global _PROGRESS
+    _PROGRESS = channel
+
+
+def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None]:
+    """Worker: returns (path, outcome, saved, text, quality); never raises.
+
+    ``quality`` is (pages, sum of page SSIM, lowest page SSIM) or None.
+    ``emit(path, fraction)`` is told how far the file is; in a worker process
+    that goes to the parent through the progress queue.
+    """
     (path, mode, dry_run, min_ssim, mrc_ssim, jobs, force, safe_text, verbose,
      decrypt, output) = task
+    if emit is None and _PROGRESS is not None:
+        def emit(name: str, fraction: float) -> None:
+            _PROGRESS.put((name, fraction))
 
     def log(message: str) -> None:
         if verbose:
             print(f"  {path.name}: {message}", file=sys.stderr, flush=True)
+
+    last = [0.0]
+
+    def progress(fraction: float) -> None:
+        if emit is not None and fraction - last[0] >= 0.01:
+            last[0] = fraction
+            emit(str(path), fraction)
 
     work = path
     try:
@@ -140,16 +166,20 @@ def _process(task) -> tuple[str, str, int, str]:
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, output)
             work = output
-        status, saved = optimize_pdf(work, mode, dry_run=dry_run, min_ssim=min_ssim,
-                                     jobs=jobs, force=force, safe_text=safe_text,
-                                     mrc_ssim=mrc_ssim, decrypt=decrypt, log=log)
-        return str(path), "ok", saved, status
+        outcome = optimize_pdf(work, mode, dry_run=dry_run, min_ssim=min_ssim,
+                               jobs=jobs, force=force, safe_text=safe_text,
+                               mrc_ssim=mrc_ssim, decrypt=decrypt, log=log,
+                               progress=progress)
+        status, saved = outcome
+        scores = getattr(outcome, "scores", ())
+        quality = (len(scores), sum(scores), min(scores)) if scores else None
+        return str(path), "ok", saved, status, quality
     except Skipped as exc:
-        return str(path), "skipped", 0, f"skipped: {exc}"
+        return str(path), "skipped", 0, f"skipped: {exc}", None
     except (OSError, ValueError) as exc:
         if work != path:
             work.unlink(missing_ok=True)
-        return str(path), "failed", 0, f"error: {exc}"
+        return str(path), "failed", 0, f"error: {exc}", None
 
 
 def _size(path: Path) -> int:
@@ -173,20 +203,26 @@ def _percent(saved: int, original: int) -> str:
 
 
 class _Bar:
-    """One redrawn line on a terminal: files done and the saving so far."""
+    """One redrawn line on a terminal: overall progress and the saving so far."""
 
     WIDTH = 24
+    EVERY = 0.1   # seconds between redraws
 
     def __init__(self, total: int):
         self.total = total
         self.shown = False
-        self.draw(0, 0, 0, "")
+        self.stamp = 0.0
 
-    def draw(self, done: int, saved: int, original: int, name: str) -> None:
-        filled = self.WIDTH * done // self.total
+    def draw(self, fraction: float, done: int, saved: int, original: int, name: str,
+             *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.stamp < self.EVERY:
+            return
+        self.stamp = now
+        filled = int(self.WIDTH * fraction)
         columns = shutil.get_terminal_size().columns
-        line = (f"[{'#' * filled}{'-' * (self.WIDTH - filled)}] {done}/{self.total}  "
-                f"-{_percent(saved, original)} ({_human(saved)})  {name}")
+        line = (f"[{'#' * filled}{'-' * (self.WIDTH - filled)}] {100 * fraction:3.0f}%  "
+                f"{done}/{self.total}  -{_percent(saved, original)} ({_human(saved)})  {name}")
         print("\r" + line[:max(columns - 1, 20)], end="\033[K", file=sys.stderr, flush=True)
         self.shown = True
 
@@ -250,15 +286,36 @@ def main(argv: list[str] | None = None) -> int:
     tasks = [(path, mode, args.dry_run, min_ssim, mrc_ssim, per_file, args.force,
               args.safe_text, args.verbose, args.decrypt, targets[path]) for path in paths]
     sizes = {str(path): _size(path) for path in paths}
+    weight = sum(sizes.values()) or 1
     failures = skipped = known = total_saved = done_size = done = 0
+    pages = ssim_sum = 0
+    lowest = 1.0
+    fractions: dict[str, float] = dict.fromkeys(sizes, 0.0)
     bar = None if args.verbose or not sys.stderr.isatty() else _Bar(len(paths))
+    current = ""
+
+    def overall() -> float:
+        return sum(sizes[name] * value for name, value in fractions.items()) / weight
+
+    def progress(name: str, fraction: float) -> None:
+        nonlocal current
+        fractions[name] = max(fractions[name], min(fraction, 0.999))
+        current = Path(name).name
+        if bar:
+            bar.draw(overall(), done, total_saved, done_size, current)
 
     def report(result) -> None:
         nonlocal failures, skipped, known, total_saved, done_size, done
-        name, outcome, saved, text = result
+        nonlocal pages, ssim_sum, lowest
+        name, outcome, saved, text, quality = result
         done += 1
         done_size += sizes[name]
         total_saved += saved
+        fractions[name] = 1.0
+        if quality:
+            pages += quality[0]
+            ssim_sum += quality[1]
+            lowest = min(lowest, quality[2])
         if bar:
             bar.clear()
         if outcome == "failed":
@@ -270,18 +327,31 @@ def main(argv: list[str] | None = None) -> int:
             if args.verbose or outcome == "skipped":
                 print(f"{name}: {text}" + (f", {saved} bytes" if saved else ""))
         if bar:
-            bar.draw(done, total_saved, done_size, Path(name).name)
+            bar.draw(overall(), done, total_saved, done_size, Path(name).name, force=True)
 
+    if bar:
+        bar.draw(0.0, 0, 0, 0, "", force=True)
     if parallel > 1:
-        with ProcessPoolExecutor(max_workers=parallel) as pool:
-            for result in pool.map(_process, tasks):
-                report(result)
+        channel = multiprocessing.Queue()
+        with ProcessPoolExecutor(max_workers=parallel, initializer=_init_worker,
+                                 initargs=(channel,)) as pool:
+            running = {pool.submit(_process, task) for task in tasks}
+            while running:
+                finished, running = wait(running, timeout=0.1, return_when=FIRST_COMPLETED)
+                try:
+                    while True:
+                        progress(*channel.get_nowait())
+                except queue.Empty:
+                    pass
+                for future in finished:
+                    report(future.result())
     else:
         for task in tasks:
-            report(_process(task))
+            report(_process(task, progress))
     if bar:
         bar.clear()
     print(f"Saved: {_human(total_saved)} ({_percent(total_saved, done_size)})" +
+          (f" SSIM {ssim_sum / pages:.4f} (lowest page {lowest:.4f})" if pages else "") +
           (" (estimate, files not changed)" if args.dry_run else "") +
           (f"; skipped: {skipped}" if skipped else "") +
           (f"; already optimized: {known} (use --force to process again)" if known else "") +

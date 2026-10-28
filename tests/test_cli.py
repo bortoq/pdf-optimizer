@@ -9,7 +9,7 @@ import pikepdf
 
 from pdfopt.cli import discover, files_at_once, main
 
-from .helpers import make_text_pdf, sign
+from .helpers import make_scan_pdf, make_text_pdf, need, sign
 
 
 def run(*argv):
@@ -50,6 +50,21 @@ class CliTests(unittest.TestCase):
             self.assertEqual(err, "")
             self.assertNotIn(str(book), out)
             self.assertRegex(out, r"Saved: [\d.]+ \S+ \([\d.]+%\)")
+
+    def test_lossless_total_has_no_ssim(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "book.pdf"
+            plain_pdf(book)
+            self.assertNotIn("SSIM", run(book)[1])
+
+    @unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
+    def test_lossy_total_shows_the_similarity(self):
+        with tempfile.TemporaryDirectory() as root:
+            book = Path(root) / "scan.pdf"
+            make_scan_pdf(book, pages=2)
+            code, out, _ = run("-q", "90", str(book))
+            self.assertEqual(code, 0)
+            self.assertRegex(out, r"Saved: .* SSIM 0\.\d{4} \(lowest page 0\.\d{4}\)")
 
     def test_progress_bar_goes_to_a_terminal_only(self):
         class Terminal(StringIO):

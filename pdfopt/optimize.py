@@ -26,6 +26,7 @@ from .pdfmodel import (
     read_marker,
     set_marker,
 )
+from .progress import Callback, Span, nothing
 from .render import VisualGate, identical_pages
 from .tools import ToolError, last_line, require, run, which
 
@@ -112,13 +113,28 @@ def _make_ghostscript(source: Path, target: Path, dpi: int, qfactor: float) -> N
 ALREADY = "already optimized"
 
 
+class Outcome(tuple):
+    """``(status, saved)``; lossy results also carry ``scores``.
+
+    ``scores`` holds the SSIM of every page of the new file against the source.
+    """
+
+    scores: tuple[float, ...]
+
+    def __new__(cls, status: str, saved: int, scores=()):
+        outcome = super().__new__(cls, (status, saved))
+        outcome.scores = tuple(scores)
+        return outcome
+
+
 class _Run:
     """State of one optimize_pdf call."""
 
     def __init__(self, path: Path, mode: str, min_ssim: float, jobs: int,
                  scratch: Path, baseline: Fingerprint, log: Log, safe_text: bool = False,
-                 mrc_ssim: float | None = None):
+                 mrc_ssim: float | None = None, progress: Callback = nothing):
         self.path = path
+        self.progress = progress
         self.mode = mode
         self.min_ssim = min_ssim
         self.mrc_ssim = mrc_ssim
@@ -148,7 +164,7 @@ class _Run:
 
     # -- the lossless stage ------------------------------------------------
 
-    def lossless_stage(self) -> Candidate | None:
+    def lossless_stage(self, progress: Callback = nothing) -> Candidate | None:
         """Build and verify the pure lossless result (also the lossy base)."""
         cut = True
         for label, options in (("lossless", {}),
@@ -159,12 +175,13 @@ class _Run:
             work = self.directory(label)
             target = work / "out.pdf"
             try:
-                report = lossless.build(self.path, target, work, self.jobs, **options)
+                report = lossless.build(self.path, target, work, self.jobs,
+                                        progress=lambda f: progress(0.8 * f), **options)
                 cut = any(note.startswith("fonts") for note in report.notes)
                 candidate = Candidate(label, target, target.stat().st_size,
                                       exact_pages=[p + 1 for p in sorted(report.visual_pages)],
                                       content=True, metadata=True)
-                self.verify(candidate)
+                self.verify(candidate, lambda f: progress(0.8 + 0.2 * f))
                 candidate.verified = True
                 self.log(f"{label}: {candidate.size} bytes ({', '.join(report.notes) or '-'})")
                 return candidate
@@ -174,36 +191,44 @@ class _Run:
 
     # -- verification ------------------------------------------------------
 
-    def verify(self, candidate: Candidate) -> None:
+    def verify(self, candidate: Candidate, progress: Callback = nothing) -> None:
         with open_pdf(candidate.path) as pdf:
             fingerprint = Fingerprint.read(pdf, candidate.path)
         compare(fingerprint, self.baseline, content=candidate.content,
                 metadata=candidate.metadata)
-        if candidate.exact_pages and not identical_pages(
+        exact = bool(candidate.exact_pages)
+        gated = candidate.gate_pages is None or bool(candidate.gate_pages)
+        share = 0.5 if exact and gated else 1.0
+        if exact and not identical_pages(
                 self.path, candidate.path, candidate.exact_pages,
-                self.directory("exact"), self.jobs):
+                self.directory("exact"), self.jobs, lambda f: progress(share * f)):
             raise ValueError("PDF: rendering changed in lossless mode")
-        if candidate.gate_pages is None or candidate.gate_pages:
+        if gated:
             pages = (list(range(1, len(self.baseline.pages) + 1))
                      if candidate.gate_pages is None else candidate.gate_pages)
-            bad = self.visual_gate().failures(candidate.path, pages, stop_early=True)
+            bad = self.visual_gate().failures(
+                candidate.path, pages, stop_early=True,
+                progress=lambda f: progress(1 - share + share * f))
             if bad:
                 raise ValueError(f"page {bad[0]} is below SSIM {self.min_ssim:.2f}")
 
     # -- lossy engines -----------------------------------------------------
 
-    def jpeg_stage(self, pdf: pikepdf.Pdf, target: Path, work: Path) -> bool:
+    def jpeg_stage(self, pdf: pikepdf.Pdf, target: Path, work: Path,
+                   progress: Callback = nothing) -> bool:
         """Re-encode images of ``pdf``, verify, undo failing pages, save.
 
         Returns False when nothing was left to save.
         """
-        counts, changes = jpegopt.optimize_jpegs(pdf, work, self.min_ssim, self.jobs)
+        counts, changes = jpegopt.optimize_jpegs(pdf, work, self.min_ssim, self.jobs,
+                                                 lambda f: progress(0.5 * f))
         if not changes:
             return False
         self.log("JPEG: " + ", ".join(f"{name}×{count}" for name, count in counts.items()))
         lossless.save(pdf, target, deflated=True)
         pages = sorted({page + 1 for change in changes for page in change.pages})
-        bad = set(self.visual_gate().failures(target, pages))
+        bad = set(self.visual_gate().failures(target, pages,
+                                              progress=lambda f: progress(0.5 + 0.5 * f)))
         if bad:
             kept = []
             for change in changes:
@@ -217,7 +242,7 @@ class _Run:
             lossless.save(pdf, target, deflated=True)
         return True
 
-    def mrc_engine(self, stage: Path) -> list[Candidate]:
+    def mrc_engine(self, stage: Path, progress: Callback = nothing) -> list[Candidate]:
         out: list[Candidate] = []
         work = self.directory("mrc")
         plain = work / "mrc.pdf"
@@ -227,12 +252,13 @@ class _Run:
 
         def chain(pdf: pikepdf.Pdf) -> None:
             layered.append(True)
-            saved.append(self.jpeg_stage(pdf, chained, work))
+            saved.append(self.jpeg_stage(pdf, chained, work, lambda f: progress(0.8 + 0.2 * f)))
 
         try:
             mrc.build(stage, plain, work, self.min_ssim, self.jobs,
                       self.visual_gate(), self.log, then=chain,
-                      symbols=not self.safe_text, relaxed=self.mrc_ssim)
+                      symbols=not self.safe_text, relaxed=self.mrc_ssim,
+                      progress=lambda f: progress(0.8 * f))
         except Exception as exc:   # any failure: keep what is already verified
             self.log(f"{'JPEG' if layered else 'MRC'}: {exc}")
             saved.clear()
@@ -240,7 +266,7 @@ class _Run:
                 # Without layered pages the JPEG stage may still help.
                 try:
                     with open_pdf(stage) as pdf:
-                        saved.append(self.jpeg_stage(pdf, chained, work))
+                        saved.append(self.jpeg_stage(pdf, chained, work, progress))
                 except Exception as error:
                     self.fail("JPEG", error)
         if layered:
@@ -281,14 +307,15 @@ class _Run:
         return tasks
 
 
-def _pick(run_: _Run, candidates: list[Candidate]) -> Candidate | None:
+def _pick(run_: _Run, candidates: list[Candidate],
+          progress: Callback = nothing) -> Candidate | None:
     """Smallest candidate that is smaller than the source and verifies."""
     for candidate in sorted(candidates, key=lambda c: c.size):
         if candidate.size >= run_.size:
             continue
         try:
             if not candidate.verified:
-                run_.verify(candidate)
+                run_.verify(candidate, progress)
         except Exception as exc:
             run_.fail(candidate.name, exc)
             continue
@@ -317,7 +344,7 @@ def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
                  min_ssim: float = MIN_SSIM, jobs: int | None = None,
                  force: bool = False, safe_text: bool = False,
                  mrc_ssim: float | None = None, decrypt: bool = False,
-                 log: Log | None = None) -> tuple[str, int]:
+                 log: Log | None = None, progress: Callback = nothing) -> Outcome:
     """Choose the smallest verified PDF and replace the source atomically.
 
     Raises ``Skipped`` for files that are deliberately left alone (signed or
@@ -328,9 +355,13 @@ def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
     cores are used unless ``jobs`` says otherwise. ``decrypt`` also takes
     files that open without a password: they are decrypted first, so the
     result carries no encryption and none of the owner's restrictions.
+    ``progress`` is called with the fraction done (0..1, never going down).
+    The result unpacks as ``(status, saved)``; its ``scores`` hold the SSIM of
+    each page of a new lossy file.
     """
     options = {"dry_run": dry_run, "min_ssim": min_ssim, "jobs": jobs, "force": force,
-               "safe_text": safe_text, "mrc_ssim": mrc_ssim, "log": log}
+               "safe_text": safe_text, "mrc_ssim": mrc_ssim, "log": log,
+               "progress": Span(progress)}
     if not decrypt:
         return _optimize(path, path, mode, **options)
     with tempfile.TemporaryDirectory(prefix=".pdfopt-open-", dir=path.parent) as keep:
@@ -354,7 +385,7 @@ def _decrypted(path: Path, directory: Path) -> Path:
 
 def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: float,
               jobs: int | None, force: bool, safe_text: bool, mrc_ssim: float | None,
-              log: Log | None) -> tuple[str, int]:
+              log: Log | None, progress: Span) -> Outcome:
     """``optimize_pdf`` on ``work``, the readable copy of ``path`` to replace."""
     if mrc_ssim is None:
         mrc_ssim = min_ssim - MRC_ALLOWANCE if min_ssim < 1.0 else min_ssim
@@ -370,7 +401,7 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
         baseline = Fingerprint.read(pdf, work)
     lossy = mode == "lossy"
     if not force and marker and marker[0] >= MARKER_VERSION and (marker[1] or not lossy):
-        return ALREADY, 0
+        return Outcome(ALREADY, 0)
     worker = find_worker()
     if lossy and which("pdftoppm") is None:
         raise ValueError("PDF: pdftoppm is needed to check the result")
@@ -380,16 +411,21 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
     with tempfile.TemporaryDirectory(prefix=".pdfopt-", dir=path.parent) as directory:
         scratch = Path(directory)
         state = _Run(work, mode, min_ssim, jobs, scratch, baseline, log, safe_text,
-                     mrc_ssim)
+                     mrc_ssim, progress)
         candidates: list[Candidate] = []
-        stage = state.lossless_stage()
+        # The lossless stage is all of the work in lossless mode; in lossy mode
+        # it is a first step, the engines take most of the time.
+        stage = state.lossless_stage(progress.part(0, 0.9 if not lossy else 0.2))
         if stage is not None:
             candidates.append(stage)
         tasks: list[Task] = []
         if lossy:
             base = stage.path if stage is not None else work
-            tasks.append(Task("MRC", lambda: state.mrc_engine(base)))
+            tasks.append(Task("MRC", lambda: state.mrc_engine(
+                base, progress.part(0.2, 0.8))))
         tasks.extend(state.external_tasks(worker))
+
+        finished = progress.part(0.2, 0.8).counter(len(tasks))
 
         def run_task(task: Task) -> list[Candidate]:
             try:
@@ -397,6 +433,8 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
             except Exception as exc:
                 state.fail(task.label, exc)
                 return []
+            finally:
+                finished()
 
         if jobs >= 4 and len(tasks) > 1:
             with ThreadPoolExecutor(max_workers=min(3, len(tasks))) as pool:
@@ -406,18 +444,24 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
             for task in tasks:
                 candidates.extend(run_task(task))
 
-        best = _pick(state, candidates)
+        best = _pick(state, candidates, progress.part(0.8, 0.85))
         if best is None:
             if not candidates and state.errors:
                 raise ValueError("PDF: " + "; ".join(state.errors))
-            return "no change", 0
+            return Outcome("no change", 0)
         final = _stamp(best, lossy, scratch)
         size = final.stat().st_size
         if size >= source_stat.st_size:
-            return "no change", 0
+            return Outcome("no change", 0)
         saving = source_stat.st_size - size
+        scores = ()
+        if lossy:
+            # The pages of the file as it will be written, against the source.
+            pages = list(range(1, len(baseline.pages) + 1))
+            scores = state.visual_gate().scores(
+                final, pages, progress=progress.part(0.85, 0.98)).values()
         if dry_run:
-            return f"possible saving ({best.name})", saving
+            return Outcome(f"possible saving ({best.name})", saving, scores)
         current = path.stat()
         if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
                 source_stat.st_dev, source_stat.st_ino, source_stat.st_size,
@@ -430,4 +474,5 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
             with contextlib.suppress(PermissionError):
                 os.chown(final, current.st_uid, current.st_gid)
         os.replace(final, path)
-        return f"compressed ({best.name})", saving
+        progress(1.0)
+        return Outcome(f"compressed ({best.name})", saving, scores)

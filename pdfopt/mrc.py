@@ -30,6 +30,7 @@ from PIL import Image, ImageFilter, TiffImagePlugin
 
 from . import imagedata, jpegopt, lossless
 from .pdfmodel import MRC_FORM_KEY, filters_of, open_pdf, page_resources
+from .progress import Callback, nothing
 from .render import SSIM_DPI, VisualGate
 from .ssim import ssim
 from .tools import run, which
@@ -745,7 +746,8 @@ def _bounded_map(pool, function, items, window: int):
 
 def add_layers(pdf: pikepdf.Pdf, scratch: Path, minimum: float, jobs: int,
                log=None, *, symbols: bool = True,
-               relaxed: float | None = None) -> list[Record]:
+               relaxed: float | None = None,
+               progress: Callback = nothing) -> list[Record]:
     """Replace scanned-page images by layered forms; returns undo records."""
     log = log or (lambda message: None)
     candidates = scan_candidates(pdf)
@@ -760,10 +762,12 @@ def add_layers(pdf: pikepdf.Pdf, scratch: Path, minimum: float, jobs: int,
         for index, (scan, layers) in enumerate(zip(candidates, stream), start=1):
             if layers is not None:
                 results.append((scan, layers))
+            progress(0.9 * index / len(candidates))
             if len(candidates) >= 50 and index % 50 == 0:
                 log(f"MRC: prepared {index}/{len(candidates)} pages")
     if not results:
         return []
+    progress(0.9)
 
     # Every ink stencil of every page, in order. Stencils that allow the same
     # symbol threshold are coded together, in chunks with shared dictionaries.
@@ -864,24 +868,30 @@ class _Inline:
 
 def build(source: Path, target: Path, scratch: Path, minimum: float, jobs: int,
           gate: VisualGate, log=None, *, then=None, symbols: bool = True,
-          relaxed: float | None = None) -> tuple[int, int]:
+          relaxed: float | None = None,
+          progress: Callback = nothing) -> tuple[int, int]:
     """Layer the scans of ``source`` into ``target``; returns (passed, rejected).
 
     Text pages are held to ``relaxed`` (when given), other pages to
     ``minimum``. ``then(pdf)`` may modify the verified layered document
-    further (the JPEG stage).
+    further (the JPEG stage). ``progress`` gets the fraction done of the
+    layering and the check; ``then`` reports for itself.
     """
     log = log or (lambda message: None)
     with open_pdf(source) as pdf:
         records = add_layers(pdf, scratch, minimum, jobs, log, symbols=symbols,
-                             relaxed=relaxed)
+                             relaxed=relaxed, progress=lambda f: progress(0.7 * f))
         if not records:
             raise ValueError("no page is suitable for layered (MRC) compression")
         lossless.save(pdf, target, deflated=True)
+        progress(0.75)
         failed: set[int] = set()
-        for threshold in sorted({r.minimum for r in records}):
+        thresholds = sorted({r.minimum for r in records})
+        for index, threshold in enumerate(thresholds):
             pages = [r.page for r in records if r.minimum == threshold]
-            failed.update(gate.failures(target, pages, minimum=threshold))
+            failed.update(gate.failures(
+                target, pages, minimum=threshold,
+                progress=lambda f, i=index: progress(0.75 + 0.25 * (i + f) / len(thresholds))))
         passed = len(records) - len(failed)
         if not passed:
             lowest = min(r.minimum for r in records)
