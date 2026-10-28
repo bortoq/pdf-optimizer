@@ -1,7 +1,5 @@
 # pdfopt
 
-**English** · [Русский](README.ru.md)
-
 A PDF optimizer. It tries several encoders, picks the smallest **verified**
 result and replaces the source file atomically, only if the file got smaller.
 
@@ -10,9 +8,8 @@ result and replaces the source file atomically, only if the file got smaller.
 - **Lossy (`-q N`)**: recompresses photos and scans for as long as the SSIM of
   every page stays at or above `N/100`.
 
-Everything runs locally; no file leaves your machine. Command-line messages
-and `--help` are currently in Russian; design notes are in
-[docs/architecture.md](docs/architecture.md) (Russian).
+Everything runs locally; no file leaves your machine. Design notes are in
+[docs/architecture.md](docs/architecture.md).
 
 ## Results
 
@@ -87,7 +84,7 @@ named was rejected (a symlink, not a `.pdf`).
 
 Without `-v` a terminal shows one progress line with the share saved so far,
 and a single total at the end. Signed PDFs and password-protected files are
-**skipped** (`пропущен: …`), which is not an error; files encrypted without a
+**skipped** (`skipped: ...`), which is not an error; files encrypted without a
 password are processed only with `--decrypt`. Already optimized files are
 counted in the total. When several files run at once, their number is bounded
 by free memory (about 700 MB per file with `-q`).

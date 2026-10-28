@@ -24,12 +24,12 @@ def open_pdf(path: Path) -> pikepdf.Pdf:
     try:
         pdf = pikepdf.open(path)
     except pikepdf.PasswordError as exc:
-        raise Skipped("нужен пароль") from exc
+        raise Skipped("password required") from exc
     except (pikepdf.PdfError, OSError) as exc:
-        raise ValueError(f"PDF: не удалось прочитать исходник: {exc}") from exc
+        raise ValueError(f"PDF: cannot read the source: {exc}") from exc
     if pdf.is_encrypted:
         pdf.close()
-        raise Skipped("зашифрованный файл (--decrypt снимает шифрование)")
+        raise Skipped("encrypted file (--decrypt removes the encryption)")
     return pdf
 
 
@@ -186,21 +186,21 @@ def compare(candidate: Fingerprint, baseline: Fingerprint, *,
     difference falls back to comparing the extracted text.
     """
     if len(candidate.pages) != len(baseline.pages):
-        raise ValueError("PDF: изменилось число страниц")
+        raise ValueError("PDF: the page count changed")
     texts_needed = False
     for new, old in zip(candidate.pages, baseline.pages):
         if (new.box, new.crop, new.rotation, new.annotations) != (
                 old.box, old.crop, old.rotation, old.annotations):
-            raise ValueError("PDF: изменились геометрия или аннотации страниц")
+            raise ValueError("PDF: page geometry or annotations changed")
         if new.content != old.content:
             texts_needed = True
     if texts_needed:
         if content:
-            raise ValueError("PDF: изменилось содержимое страниц в режиме без потерь")
+            raise ValueError("PDF: page content changed in lossless mode")
         if candidate.text() != baseline.text():
-            raise ValueError("PDF: изменился текст страниц")
+            raise ValueError("PDF: page text changed")
     if metadata and candidate.metadata != baseline.metadata:
-        raise ValueError("PDF: изменились метаданные в режиме без потерь")
+        raise ValueError("PDF: metadata changed in lossless mode")
 
 
 def read_marker(pdf: pikepdf.Pdf) -> tuple[int, bool] | None:

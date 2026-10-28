@@ -97,7 +97,7 @@ class SubsetTests(unittest.TestCase):
                 self.assertEqual(cut(path), (set(), 0))
 
 
-@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class LosslessBuildTests(unittest.TestCase):
     def test_build_cuts_fonts_and_renders_the_same(self):
         for kind, mac_only in (("simple", False), ("cid", False), ("simple", True)):

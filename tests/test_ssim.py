@@ -51,7 +51,7 @@ class SsimTests(unittest.TestCase):
         halves = [ssim(image[a:b], other[a:b]) for a, b in ((0, 352), (348, 700))]
         self.assertAlmostEqual(whole, sum(halves) / 2, delta=0.02)
 
-    @unittest.skipUnless(need("ffmpeg"), "ffmpeg не установлен")
+    @unittest.skipUnless(need("ffmpeg"), "ffmpeg is not installed")
     def test_matches_ffmpeg(self):
         image = noisy(shape=(120, 150))
         other = np.asarray(Image.fromarray(image).filter(ImageFilter.GaussianBlur(1.5)))

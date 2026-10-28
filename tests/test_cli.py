@@ -36,7 +36,7 @@ class CliTests(unittest.TestCase):
             original = book.read_bytes()
             code, out, _ = run("--dry-run", book)
             self.assertEqual(code, 0)
-            self.assertIn("оценка", out)
+            self.assertIn("estimate", out)
             self.assertEqual(book.read_bytes(), original)
             self.assertEqual(run(book)[0], 0)
             self.assertLess(book.stat().st_size, len(original))
@@ -49,7 +49,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(err, "")
             self.assertNotIn(str(book), out)
-            self.assertRegex(out, r"Экономия: [\d.]+ \S+ \([\d.]+%\)")
+            self.assertRegex(out, r"Saved: [\d.]+ \S+ \([\d.]+%\)")
 
     def test_progress_bar_goes_to_a_terminal_only(self):
         class Terminal(StringIO):
@@ -89,7 +89,7 @@ class CliTests(unittest.TestCase):
             original = book.read_bytes()
             code, out, _ = run("--decrypt", book)
             self.assertEqual(code, 0)
-            self.assertIn("нужен пароль", out)
+            self.assertIn("password required", out)
             self.assertEqual(book.read_bytes(), original)
 
     def test_signed_pdf_is_skipped_with_exit_zero(self):
@@ -100,7 +100,7 @@ class CliTests(unittest.TestCase):
             original = book.read_bytes()
             code, out, _ = run(book)
             self.assertEqual(code, 0)
-            self.assertIn("пропущен", out)
+            self.assertIn("skipped", out)
             self.assertEqual(book.read_bytes(), original)
 
     def test_broken_pdf_gives_exit_one(self):
@@ -109,7 +109,7 @@ class CliTests(unittest.TestCase):
             book.write_bytes(b"junk")
             code, _, err = run(book)
             self.assertEqual(code, 1)
-            self.assertIn("ошибка", err)
+            self.assertIn("error", err)
 
     def test_quality_out_of_range_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
@@ -124,7 +124,7 @@ class CliTests(unittest.TestCase):
 
         def fake(path, mode, **options):
             seen.append(options["mrc_ssim"])
-            return "без изменений", 0
+            return "no change", 0
 
         with tempfile.TemporaryDirectory() as root, \
                 patch("pdfopt.cli.optimize_pdf", fake):
@@ -159,7 +159,7 @@ class CliTests(unittest.TestCase):
                 code, _, err = run(book)
             self.assertEqual(code, 0)
             self.assertNotIn("hpdf-worker", err)
-            self.assertIn("hpdf-worker не найден", run("-v", book)[2])
+            self.assertIn("hpdf-worker not found", run("-v", book)[2])
 
     def test_several_files_in_parallel(self):
         with tempfile.TemporaryDirectory() as root:
@@ -183,8 +183,8 @@ class CliTests(unittest.TestCase):
             book = Path(root) / "book.pdf"
             plain_pdf(book)
             run(book)
-            self.assertIn("уже оптимизирован", run("-v", book)[1])
-            self.assertNotIn("уже оптимизирован", run("-v", "--force", book)[1])
+            self.assertIn("already optimized", run("-v", book)[1])
+            self.assertNotIn("already optimized", run("-v", "--force", book)[1])
 
 
 class OptionTests(unittest.TestCase):
@@ -238,14 +238,14 @@ class OptionTests(unittest.TestCase):
             (base / "link.pdf").symlink_to(base / "a.pdf")
             code, _, err = run(base / "link.pdf")
             self.assertEqual(code, 2)
-            self.assertIn("символьная ссылка", err)
+            self.assertIn("symbolic links", err)
 
     def test_already_optimized_files_are_counted_without_verbose(self):
         with tempfile.TemporaryDirectory() as root:
             book = Path(root) / "book.pdf"
             plain_pdf(book)
             run(book)
-            self.assertIn("уже оптимизировано: 1", run(book)[1])
+            self.assertIn("already optimized: 1", run(book)[1])
 
     def test_parallel_files_are_bounded_by_memory(self):
         self.assertEqual(files_at_once(8, 10, "lossy", available_mb=1500), 2)

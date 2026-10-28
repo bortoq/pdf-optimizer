@@ -18,34 +18,33 @@ from .pdfmodel import Skipped
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pdfopt",
-        description="Оптимизация PDF: без потерь по умолчанию, с потерями при -q.",
+        description="Shrink PDF files. Lossless by default, lossy with -q.",
     )
     parser.add_argument("-q", "--quality", type=int, metavar="1..100",
-                        help="минимальный SSIM страницы в процентах; включает lossy")
+                        help="lowest SSIM a page may have, in percent; turns on lossy mode")
     parser.add_argument("--dry-run", action="store_true",
-                        help="посчитать результат, не заменяя исходник")
+                        help="work out the result but do not replace the source file")
     parser.add_argument("-r", "--recursive", action="store_true",
-                        help="обрабатывать PDF в подпапках")
+                        help="also process PDF files in subfolders")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="печатать результат по каждому файлу, размеры и причины отказа "
-                        "по каждому движку и предупреждения")
+                        help="print the result of every file, the size and rejection reason of "
+                        "every engine, and warnings")
     parser.add_argument("--decrypt", action="store_true",
-                        help="снять шифрование с файлов, открывающихся без пароля, и "
-                        "оптимизировать их; ограничения владельца (печать, копирование) "
-                        "пропадают")
+                        help="remove the encryption of files that open without a password and "
+                        "optimize them; the owner's limits (printing, copying) are lost")
     parser.add_argument("--force", action="store_true",
-                        help="обработать файл, даже если он уже оптимизирован")
+                        help="process a file even if it is already optimized")
     parser.add_argument("--safe-text", action="store_true",
-                        help="при -q кодировать маску текста без символьного режима "
-                        "JBIG2: крупнее, зато без подмены похожих букв")
+                        help="with -q, do not use the JBIG2 symbol mode for text: "
+                        "files are larger, but similar letters can never be swapped")
     parser.add_argument("--mrc-quality", type=int, metavar="1..100",
-                        help="минимальный SSIM текстовых страниц MRC в процентах "
-                        f"(по умолчанию на {round(MRC_ALLOWANCE * 100)} ниже -q)")
+                        help="lowest SSIM of MRC text pages, in percent "
+                        f"(default: {round(MRC_ALLOWANCE * 100)} below -q)")
     parser.add_argument("-o", "--output", type=Path, metavar="PATH",
-                        help="не менять исходники: записать результат в этот файл "
-                        "(для одного входного файла) или в этот каталог (для нескольких)")
+                        help="keep the source files: write the result to this file "
+                        "(one input file) or to this folder (several input files)")
     parser.add_argument("-j", "--jobs", type=int, metavar="N",
-                        help="сколько ядер использовать (по умолчанию все)")
+                        help="how many CPU cores to use (default: all)")
     parser.add_argument("--version", action="version", version=f"pdfopt {__version__}")
     parser.add_argument("paths", nargs="+", type=Path, metavar="PATH")
     return parser
@@ -72,12 +71,12 @@ def discover(paths: list[Path], recursive: bool,
     for target in paths:
         if target.is_symlink():
             if rejected is not None:
-                rejected.append(f"{target}: символьная ссылка не обрабатывается "
-                                "(укажите путь к самому файлу)")
+                rejected.append(f"{target}: symbolic links are not processed "
+                                "(give the path of the file itself)")
             continue
         if target.is_file():
             if target.suffix.lower() != ".pdf" and rejected is not None:
-                rejected.append(f"{target}: не PDF (расширение не .pdf)")
+                rejected.append(f"{target}: not a PDF (the name does not end in .pdf)")
             add(target)
         elif target.is_dir():
             if recursive:
@@ -90,7 +89,7 @@ def discover(paths: list[Path], recursive: bool,
                 for child in sorted(target.iterdir()):
                     add(child)
         else:
-            raise ValueError(f"путь не найден: {target}")
+            raise ValueError(f"path not found: {target}")
     return found
 
 
@@ -146,11 +145,11 @@ def _process(task) -> tuple[str, str, int, str]:
                                      mrc_ssim=mrc_ssim, decrypt=decrypt, log=log)
         return str(path), "ok", saved, status
     except Skipped as exc:
-        return str(path), "skipped", 0, f"пропущен: {exc}"
+        return str(path), "skipped", 0, f"skipped: {exc}"
     except (OSError, ValueError) as exc:
         if work != path:
             work.unlink(missing_ok=True)
-        return str(path), "failed", 0, f"ошибка: {exc}"
+        return str(path), "failed", 0, f"error: {exc}"
 
 
 def _size(path: Path) -> int:
@@ -162,11 +161,11 @@ def _size(path: Path) -> int:
 
 def _human(size: int) -> str:
     value = float(size)
-    for unit in ("байт", "КБ", "МБ", "ГБ"):
-        if value < 1024 or unit == "ГБ":
-            return f"{value:.0f} {unit}" if unit == "байт" else f"{value:.1f} {unit}"
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "bytes" else f"{value:.1f} {unit}"
         value /= 1024
-    return f"{size} байт"
+    return f"{size} bytes"
 
 
 def _percent(saved: int, original: int) -> str:
@@ -201,13 +200,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     for name, value in (("quality", args.quality), ("mrc-quality", args.mrc_quality)):
         if value is not None and not 1 <= value <= 100:
-            print(f"pdfopt: {name}: ожидается число от 1 до 100", file=sys.stderr)
+            print(f"pdfopt: {name}: expected a number from 1 to 100", file=sys.stderr)
             return 2
     mode = "lossy" if args.quality is not None else "lossless"
     min_ssim = args.quality / 100 if args.quality is not None else MIN_SSIM
     mrc_ssim = args.mrc_quality / 100 if args.mrc_quality is not None else None
     if args.jobs is not None and args.jobs < 1:
-        print("pdfopt: jobs: ожидается число не меньше 1", file=sys.stderr)
+        print("pdfopt: jobs: expected a number of at least 1", file=sys.stderr)
         return 2
     rejected: list[str] = []
     try:
@@ -216,9 +215,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"pdfopt: {exc}", file=sys.stderr)
         return 2
     for line in rejected:
-        print(f"pdfopt: пропущен {line}", file=sys.stderr)
+        print(f"pdfopt: skipped {line}", file=sys.stderr)
     if not paths:
-        print("Подходящих файлов не найдено.")
+        print("No PDF files found.")
         return 2 if rejected else 0
     targets: dict[Path, Path | None] = dict.fromkeys(paths)
     if args.output is not None:
@@ -227,23 +226,23 @@ def main(argv: list[str] | None = None) -> int:
         else:
             names = [path.name for path in paths]
             if len(set(names)) != len(names):
-                print("pdfopt: -o: у входных файлов повторяются имена", file=sys.stderr)
+                print("pdfopt: -o: some input files have the same name", file=sys.stderr)
                 return 2
             if args.output.is_file():
-                print("pdfopt: -o: для нескольких файлов нужен каталог", file=sys.stderr)
+                print("pdfopt: -o: several input files need a folder", file=sys.stderr)
                 return 2
             for path in paths:
                 targets[path] = (args.output / path.name).absolute()
         if any(target == path for path, target in targets.items()):
-            print("pdfopt: -o: результат совпадает с исходным файлом", file=sys.stderr)
+            print("pdfopt: -o: the output is the same as the input file", file=sys.stderr)
             return 2
     if args.verbose and not ect_available():
-        print("pdfopt: предупреждение: модуль ECT не собран "
-              "(python3 setup.py build_ext --inplace), потоки сжимаются zlib",
+        print("pdfopt: warning: the ECT module is not built "
+              "(python3 setup.py build_ext --inplace), streams are packed with zlib",
               file=sys.stderr)
     if args.verbose and find_worker() is None:
-        print("pdfopt: предупреждение: hpdf-worker не найден в PATH, "
-              "Hyper Compress не используется", file=sys.stderr)
+        print("pdfopt: warning: hpdf-worker not found in PATH, "
+              "Hyper Compress is not used", file=sys.stderr)
 
     cores = args.jobs or os.cpu_count() or 1
     parallel = files_at_once(cores, len(paths), mode)
@@ -269,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             skipped += outcome == "skipped"
             known += text == ALREADY
             if args.verbose or outcome == "skipped":
-                print(f"{name}: {text}" + (f", {saved} байт" if saved else ""))
+                print(f"{name}: {text}" + (f", {saved} bytes" if saved else ""))
         if bar:
             bar.draw(done, total_saved, done_size, Path(name).name)
 
@@ -282,9 +281,9 @@ def main(argv: list[str] | None = None) -> int:
             report(_process(task))
     if bar:
         bar.clear()
-    print(f"Экономия: {_human(total_saved)} ({_percent(total_saved, done_size)})" +
-          (" (оценка, файлы не изменены)" if args.dry_run else "") +
-          (f"; пропущено: {skipped}" if skipped else "") +
-          (f"; уже оптимизировано: {known} (--force — обработать снова)" if known else "") +
-          (f"; ошибок: {failures}" if failures else ""))
+    print(f"Saved: {_human(total_saved)} ({_percent(total_saved, done_size)})" +
+          (" (estimate, files not changed)" if args.dry_run else "") +
+          (f"; skipped: {skipped}" if skipped else "") +
+          (f"; already optimized: {known} (use --force to process again)" if known else "") +
+          (f"; errors: {failures}" if failures else ""))
     return 1 if failures else 0

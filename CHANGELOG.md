@@ -1,119 +1,133 @@
-# Изменения
+# Changelog
 
-## Не выпущено
+## Unreleased
 
-**Исправления по аудиту**
-- Урезание шрифтов: таблицы cmap восстанавливаются после подмножества. Шрифты
-  без `/Encoding` с единственной таблицей (1, 0) (экспорт LibreOffice) теряли
-  маршрут «код → глиф», проверка отрисовки браковала результат, и вместе со
-  шрифтами отключались преобразования картинок. Теперь и это работает, а при
-  сбое урезания шрифтов отключается только оно (`lossless-nofonts`).
-- `-o`/`--output` (файл или каталог, исходники не трогаются), `-j`/`--jobs`,
-  `--version`. Явно указанные символьная ссылка или не-PDF объясняются
-  (код возврата 2, если обрабатывать нечего); «уже оптимизировано: N» в итоге.
-- Число файлов, обрабатываемых одновременно, ограничено свободной памятью
-  (≈700 МБ на файл при `-q`, ≈300 МБ без потерь).
-- Dockerfile со всеми внешними программами; английский README (русский —
-  `README.ru.md`), таблица результатов; workflow выпуска (колёса cibuildwheel
-  + sdist → PyPI по тегу `v*`); `py.typed`.
-- Формулировка про «пиксель-в-пиксель» уточнена: проверка идёт при 100 dpi.
+**Audit fixes**
+- Font cutting: the cmap tables are rebuilt after the subset. Fonts without
+  `/Encoding` and with a single (1, 0) table (LibreOffice export) lost the way
+  from code to glyph, the rendering check rejected the result, and the image
+  changes were switched off together with the fonts. This works now, and when a
+  font cut fails, only the font cutting is dropped (`lossless-nofonts`).
+- `-o`/`--output` (a file or a folder; the sources are not touched),
+  `-j`/`--jobs`, `--version`. A symlink or a non-PDF named on the command line
+  is explained (exit code 2 when there is nothing to do); the total shows
+  "already optimized: N".
+- The number of files processed at once is bounded by free memory (about 700 MB
+  per file with `-q`, 300 MB without).
+- Dockerfile with all external programs; English README and a results table;
+  release workflow (cibuildwheel wheels + sdist → PyPI on a `v*` tag);
+  `py.typed`.
+- The "pixel-identical" wording is exact now: the check runs at 100 dpi.
+- All messages, `--help`, docs and tests are in plain English.
 
-**Скорость**
-- Проверка страниц рендером делится на куски по числу ядер, а не по 8
-  страниц: на 9 страницах работали 2 потока из 12. Слойный (MRC) режим:
-  скан 9 страниц цветной 55 → 22 с, серый 42 → 11 с (результат тот же).
-- Наложение слоёв при подборе фона считается быстрее (≈15 %).
+**Speed**
+- The render check splits pages into chunks by core count instead of 8 pages:
+  with 9 pages only 2 of 12 threads were busy. Layered (MRC) mode: a 9-page
+  colour scan 55 → 22 s, a grayscale one 42 → 11 s (same result).
+- Compositing while the background is searched is about 15 % faster.
 
-**Интерфейс**
-- Без `-v` вывод минимален: индикатор прогресса с долей сэкономленного (в
-  терминале) и итоговая строка; предупреждения о `hpdf-worker` и ECT — только
-  с `-v`; предупреждения fontTools о слегка повреждённых шрифтах убраны.
-- `--decrypt`: файлы с шифрованием, открывающиеся без пароля, снимаются и
-  оптимизируются (результат без шифрования). Файлы с паролем по-прежнему
-  пропускаются.
+**Interface**
+- Without `-v` the output is minimal: a progress line with the share saved (on a
+  terminal) and a total line. Warnings about `hpdf-worker` and ECT appear only
+  with `-v`; fontTools warnings about slightly damaged fonts are silenced.
+- `--decrypt`: files with encryption that open without a password are decrypted
+  and optimized (the result has no encryption). Files that need a password are
+  still skipped.
 
-**Без потерь**
-- Шрифты TrueType урезаются до используемых глифов (fontTools, номера глифов
-  сохраняются): документ Word 1414 → 1073 КБ (−24 %), pdfTeX с картинками из
-  Office −16 %.
-- JPEG перепаковывается `jpegtran` из mozjpeg вместо libjpeg: −0,7 % на
-  фотосканах, −12…28 % на JPEG в статьях (файлы −6…8 %); то же для JPEG,
-  которые pdfopt создаёт сам.
-- ECT уровня 6 для потоков больше 4 МБ: статья с картинкой 25 МБ — 38 с →
-  11 с ценой ~0,1 %; Flate распаковывается не дальше бюджета ECT.
-- Модуль ECT отвергает уровни вне 2–9 (уровень 1 не завершался).
-- Новые обязательные зависимости: `fonttools`, `mozjpeg-lossless-optimization`;
-  `jpegtran` больше не нужен.
+**Lossless**
+- TrueType fonts are cut to the glyphs in use (fontTools, glyph ids kept): a Word
+  document 1414 → 1073 KB (−24 %), pdfTeX with images from Office −16 %.
+- JPEG is repacked with mozjpeg's `jpegtran` instead of libjpeg: −0.7 % on photo
+  scans, −12…28 % on JPEG in papers (files −6…8 %); the same for the JPEG that
+  pdfopt creates itself.
+- ECT level 6 for streams above 4 MB: a paper with a 25 MB image 38 s → 11 s at
+  a cost of about 0.1 %; Flate is not unpacked beyond the ECT budget.
+- The ECT module rejects levels outside 2–9 (level 1 did not finish).
+- New required dependencies: `fonttools`, `mozjpeg-lossless-optimization`;
+  `jpegtran` is no longer needed.
 
-**С потерями**
-- MRC: размер на уровне DjVu при том же качестве (9 страниц скана, `-q 90` и `-q 96`:
-  серый 298 → 104 КБ, цветной 390 → 112 КБ; DjVu — 108 и 111 КБ).
-  - JBIG2 с порогом совпадения символов по размеру букв, для каждой полосы
-    строк: 0,80 для обычного текста, 0,85/0,90 для мелкого, совсем мелкий —
-    без потерь; сноски получают отдельную маску (защита от подмены 6↔8, 9↔8).
-  - Пороги не выше 0,9: jbig2enc 0.28 (Ubuntu 24.04) отвергал 0,92, и
-    символьный режим молча не работал.
-  - Маска сглаживается голосованием 3×3.
-  - Фон 100/50 dpi вместо 150/100; JPEG 2000 с коэффициентами сжатия до 2000:1
-    (раньше не больше 50:1 и почти никогда не выигрывал у JPEG).
-  - Цветной текст: отдельная маска на каждую краску вместо цветной JPEG-картинки.
-  - Отдельный порог для текстовых страниц, `--mrc-quality` (по умолчанию
-    `-q` − 6): при `-q 96` MRC раньше не срабатывал на реальных сканах
-    (серый скан 10,9 МБ → 104 КБ).
-  - Сканы с ICC-профилем (ICCBased, CalRGB) сохраняют своё цветовое
-    пространство в слоях; раньше фон записывался как DeviceRGB/DeviceGray.
-- Ghostscript действительно предлагается документам без текста: признак
-  текстового слоя срабатывал на любой странице с содержимым, и движок не
-  запускался никогда.
+**Lossy**
+- MRC: size on par with DjVu at the same quality (9-page scans, `-q 90` and
+  `-q 96`: grayscale 298 → 104 KB, colour 390 → 112 KB; DjVu 108 and 111 KB).
+  - JBIG2 with a symbol match threshold chosen by letter size, per band of
+    lines: 0.80 for normal text, 0.85/0.90 for small text, very small text
+    lossless; footnotes get their own mask (protects against 6↔8 and 9↔8 swaps).
+  - Thresholds stay at 0.9 or below: jbig2enc 0.28 (Ubuntu 24.04) rejected
+    0.92, and the symbol mode silently did not work.
+  - The mask is smoothed by a 3×3 vote.
+  - Background at 100/50 dpi instead of 150/100; JPEG 2000 with ratios up to
+    2000:1 (before, at most 50:1, which almost never beat JPEG).
+  - Coloured text: one mask per ink instead of a colour JPEG image.
+  - A separate threshold for text pages, `--mrc-quality` (default `-q` − 6):
+    with `-q 96` MRC used to fail on real scans (a 10.9 MB grayscale scan →
+    104 KB).
+  - Scans with an ICC profile (ICCBased, CalRGB) keep their colour space in the
+    layers; before, the background was written as DeviceRGB/DeviceGray.
+- Ghostscript is really offered to documents without text: the text-layer test
+  fired on any page with content, so the engine never ran.
 
-**Надёжность**
-- Сбой на одной странице MRC больше не отменяет MRC и JPEG для всего документа.
-- Распаковка картинок ограничена (512 МБ; Flate — только до нужного размера):
-  «бомба» распаковки не исчерпает память. `DecompressionBombError` Pillow
-  перехватывается везде.
-- RGB→Gray без потерь не трогает картинки с `/Decode` (массив стал бы
-  невалидным).
-- При замене файла от root сохраняется владелец.
+**Reliability**
+- A failure on one MRC page no longer cancels MRC and JPEG for the whole
+  document.
+- Image decoding is bounded (512 MB; Flate only to the needed size): a
+  decompression bomb cannot exhaust memory. Pillow's `DecompressionBombError`
+  is caught everywhere.
+- Lossless RGB→Gray leaves images with `/Decode` alone (the array would become
+  invalid).
+- When root replaces a file, the owner is kept.
 
-**Сборка**
-- Лицензия MIT (`LICENSE`); пакет в целом — `MIT AND Apache-2.0` из-за
-  встроенных ECT и Zopfli.
-- sdist собирается: `MANIFEST.in` с заголовками ECT; лицензии ECT/Zopfli
-  (Apache 2.0) попадают в sdist и в wheel (`license-files`), исходники C++ в
-  wheel больше не кладутся. CI собирает sdist и wheel из него.
-- CI снова сверяет SSIM с ffmpeg и запускает тесты Ghostscript.
+**Build**
+- MIT license (`LICENSE`); the package as a whole is `MIT AND Apache-2.0`
+  because of the bundled ECT and Zopfli.
+- The sdist builds: `MANIFEST.in` with the ECT headers; the ECT/Zopfli licenses
+  (Apache 2.0) go into the sdist and the wheel (`license-files`); the C++
+  sources are no longer put in the wheel. CI builds the sdist and a wheel from it.
+- CI compares SSIM with ffmpeg again and runs the Ghostscript tests.
+- CI runs on Linux, macOS and Windows; `setup.py` knows MSVC and the ECT
+  extension is optional (zlib is used if it does not build).
 
 **API**
-- `optimize_pdf`: всё после `mode` — только именованные аргументы
-  (позиционный `dry_run` легко путался с порогом).
+- `optimize_pdf`: everything after `mode` is keyword-only (a positional
+  `dry_run` was easily mixed up with the threshold).
+
+## TODO
+
+- **Smoother `-q` scale on scans (decision postponed).** `-q 90`, `-q 85` and
+  `-q 80` give byte-identical files on scans, while `-q 96` gives a file four
+  times larger. The search reaches its floor (background at the lowest dpi and
+  JPEG quality). Options: lower the floors (more dpi steps, a wider JPEG quality
+  range) and measure the quality cost, or print the threshold that was really
+  reached.
 
 ## 0.2.0
 
-**Без потерь**
-- Один разбор файла вместо пяти независимых движков; проходы складываются.
-- pikepdf вместо внешнего `qpdf` (object/xref streams всегда доступны), ECT -9
-  (исходники из katzip, `pdfopt/_ect`) для Deflate.
-- Перекодирование картинок: RGB→Gray, 8→1 бит, PNG-предикторы, G4/Flate→JBIG2 generic.
-- Дедупликация потоков, удаление миниатюр.
-- Пиксельная проверка изменённых страниц.
+**Lossless**
+- One parse of the file instead of five independent engines; the passes add up.
+- pikepdf instead of the external `qpdf` (object/xref streams are always
+  available), ECT -9 (sources from katzip, `pdfopt/_ect`) for Deflate.
+- Image re-encoding: RGB→Gray, 8→1 bit, PNG predictors, G4/Flate→JBIG2 generic.
+- Stream deduplication, thumbnail removal.
+- Pixel check of the changed pages.
 
-**С потерями**
-- MRC: адаптивная бинаризация, нормализованное заполнение фона, цветной слой
-  текста, пустые страницы, JBIG2 по чанкам, сканы в Flate/JPX, разделяемые слои.
-- JPEG: dpi из геометрии страницы, бисекция качества, Flate-фото → JPEG.
+**Lossy**
+- MRC: adaptive binarization, normalized background filling, a colour text
+  layer, empty pages, JBIG2 in chunks, scans in Flate/JPX, shared layers.
+- JPEG: dpi from the page geometry, quality bisection, Flate photos → JPEG.
 
-**Скорость**
-- SSIM в процессе (по формуле ffmpeg), без запуска `ffmpeg` на каждую страницу.
-- Проверка кандидатов от меньшего; отпечаток content-хэшами вместо извлечения текста.
-- Рендеринг кусками, общий эталон, ранний выход; параллелизм по файлам (`-j`).
+**Speed**
+- SSIM in-process (ffmpeg's formula), no `ffmpeg` process per page.
+- Candidates are checked from the smallest; the fingerprint uses content hashes
+  instead of text extraction.
+- Rendering in chunks, a shared reference, early exit; parallelism across files.
 
-**Надёжность**
-- Метка `/PdfOpt`: нет повторного сжатия; `--force`.
-- Подписанные/зашифрованные файлы — «пропущен», код возврата 0.
-- Подпись ищется по объектам, а не по тексту файла.
+**Reliability**
+- The `/PdfOpt` marker: no second compression; `--force`.
+- Signed or encrypted files are "skipped", exit code 0.
+- The signature is searched in objects, not in the file text.
 
-**CLI:** `-v`, `--force`, `--safe-text`. Убраны `-j` (всегда все ядра), `--fast`
-(всегда ECT -9), `--version`, `--pdf-worker` (`hpdf-worker` берётся из `PATH`,
-если нет — предупреждение), `--mode`, `--lossless`, `--no-dry-run`,
-`--no-recursive`, переменные `*_HYPER_WORKER`/`HYPER_DRV`, каталог `third_party`.
-Исправлено падение `pdfopt -h` (знак `%` в справке).
+**CLI:** `-v`, `--force`, `--safe-text`. Removed: `-j` (always all cores; it
+came back later), `--fast` (always ECT -9), `--version` (it came back later),
+`--pdf-worker` (`hpdf-worker` is taken from `PATH`, a warning if it is missing),
+`--mode`, `--lossless`, `--no-dry-run`, `--no-recursive`, the variables
+`*_HYPER_WORKER`/`HYPER_DRV`, the `third_party` folder. Fixed a crash of
+`pdfopt -h` (a `%` sign in the help).

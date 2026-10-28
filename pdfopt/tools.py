@@ -22,7 +22,7 @@ def which(name: str) -> str | None:
 def require(name: str) -> str:
     found = which(name)
     if found is None:
-        raise ToolError(f"{name} не найден")
+        raise ToolError(f"{name} not found")
     return found
 
 
@@ -53,4 +53,4 @@ def last_line(completed: subprocess.CompletedProcess) -> str:
     if isinstance(text, bytes):
         text = text.decode("utf-8", "replace")
     lines = text.strip().splitlines()
-    return lines[-1] if lines else f"код выхода {completed.returncode}"
+    return lines[-1] if lines else f"exit code {completed.returncode}"

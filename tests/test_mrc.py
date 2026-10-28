@@ -142,7 +142,7 @@ class StencilTests(unittest.TestCase):
             self.assertTrue(np.array_equal(rows >> 0, rows))
             self.assertLess(len(data), len(packed.tobytes()))
 
-    @unittest.skipUnless(need("jbig2"), "jbig2 не установлен")
+    @unittest.skipUnless(need("jbig2"), "jbig2 is not installed")
     def test_symbol_chunks_share_a_dictionary(self):
         stencils = []
         for shade in (10, 30, 50):
@@ -156,7 +156,7 @@ class StencilTests(unittest.TestCase):
         self.assertTrue(symbols)
         self.assertEqual(len(pages), 3)
 
-    @unittest.skipUnless(need("jbig2"), "jbig2 не установлен")
+    @unittest.skipUnless(need("jbig2"), "jbig2 is not installed")
     def test_symbol_mode_passes_the_threshold(self):
         bitmap = text_image(600, 800)
         ink = mrc.ink_mask(gray(bitmap), 200)
@@ -176,7 +176,7 @@ class StencilTests(unittest.TestCase):
         # jbig2enc 0.28 (Ubuntu 24.04) rejects -t above 0.9.
         self.assertLessEqual(max(t for _, t in mrc.JBIG2_THRESHOLDS), 0.9)
 
-    @unittest.skipUnless(need("jbig2"), "jbig2 не установлен")
+    @unittest.skipUnless(need("jbig2"), "jbig2 is not installed")
     def test_lossless_threshold_uses_the_generic_coder(self):
         bitmap = text_image(600, 800)
         ink = mrc.ink_mask(gray(bitmap), 200)
@@ -215,7 +215,7 @@ class StencilTests(unittest.TestCase):
         self.assertEqual(mrc.size_classes(np.zeros((10, 10), bool)), [])
 
 
-    @unittest.skipUnless(need("jbig2"), "jbig2 не установлен")
+    @unittest.skipUnless(need("jbig2"), "jbig2 is not installed")
     def test_generic_mode_has_no_dictionary(self):
         bitmap = text_image(600, 800)
         ink = mrc.ink_mask(gray(bitmap), 200)
@@ -274,7 +274,7 @@ class LayerTests(unittest.TestCase):
             fg = mrc._foreground(np.asarray(bitmap.convert("RGB")), ink, 200)
             self.assertEqual(mrc._Page(bitmap, ink, fg, 200, 0.96).text_like(), expected)
 
-    @unittest.skipUnless(need("opj_compress"), "opj_compress не установлен")
+    @unittest.skipUnless(need("opj_compress"), "opj_compress is not installed")
     def test_flat_background_prefers_jpeg2000(self):
         blank = Image.new("RGB", (2400, 3000), (245, 240, 230))
         job = job_for(blank, page=(576.0, 720.0))   # 300 dpi
@@ -285,7 +285,7 @@ class LayerTests(unittest.TestCase):
         self.assertLess(len(layers.background), 2_000)
 
 
-@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class BuildTests(unittest.TestCase):
     def build(self, source, root, minimum=0.96, jobs=2):
         scratch = Path(root)
@@ -329,7 +329,7 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(passed, 1)
             self.assertEqual(gate.failures(target, [1]), [])
 
-    @unittest.skipUnless(need("jbig2"), "jbig2 не установлен")
+    @unittest.skipUnless(need("jbig2"), "jbig2 is not installed")
     def test_chunked_dictionaries_and_generic_mode_both_render_correctly(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / "scan.pdf"
@@ -410,7 +410,7 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(sorted(r.page for r in records), [1, 3])
 
 
-@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class RestoreTests(unittest.TestCase):
     def test_pages_the_gate_rejects_return_to_the_original_image(self):
         with tempfile.TemporaryDirectory() as root:
@@ -435,7 +435,7 @@ class RestoreTests(unittest.TestCase):
                                             scratch / "exact"))
 
 
-@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class ColourSpaceTests(unittest.TestCase):
     def test_icc_scan_keeps_its_colour_space(self):
         with tempfile.TemporaryDirectory() as root:

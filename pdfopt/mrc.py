@@ -755,7 +755,7 @@ def add_layers(pdf: pikepdf.Pdf, scratch: Path, minimum: float, jobs: int,
             if layers is not None:
                 results.append((scan, layers))
             if len(candidates) >= 50 and index % 50 == 0:
-                log(f"MRC: подготовлено {index}/{len(candidates)} страниц")
+                log(f"MRC: prepared {index}/{len(candidates)} pages")
     if not results:
         return []
 
@@ -870,7 +870,7 @@ def build(source: Path, target: Path, scratch: Path, minimum: float, jobs: int,
         records = add_layers(pdf, scratch, minimum, jobs, log, symbols=symbols,
                              relaxed=relaxed)
         if not records:
-            raise ValueError("нет страниц, подходящих для слойного сжатия MRC")
+            raise ValueError("no page is suitable for layered (MRC) compression")
         lossless.save(pdf, target, deflated=True)
         failed: set[int] = set()
         for threshold in sorted({r.minimum for r in records}):
@@ -879,15 +879,15 @@ def build(source: Path, target: Path, scratch: Path, minimum: float, jobs: int,
         passed = len(records) - len(failed)
         if not passed:
             lowest = min(r.minimum for r in records)
-            raise ValueError(f"ни одна страница MRC не прошла SSIM ≥ {lowest:.2f}")
+            raise ValueError(f"no MRC page reached SSIM {lowest:.2f}")
         if failed:
             for record in records:
                 if record.page in failed:
                     restore(record)
             lossless.save(pdf, target, deflated=True)
         text = sum(r.minimum < minimum and r.page not in failed for r in records)
-        log(f"MRC: принято {passed}, отклонено {len(failed)} страниц" +
-            (f" (по порогу текста {relaxed:.2f}: {text})" if text else ""))
+        log(f"MRC: accepted {passed}, rejected {len(failed)} pages" +
+            (f" (text threshold {relaxed:.2f}: {text})" if text else ""))
         if then is not None:
             then(pdf)
         return passed, len(failed)

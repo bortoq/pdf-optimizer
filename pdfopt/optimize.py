@@ -82,7 +82,7 @@ def _make_hyper(worker: Path, source: Path, target: Path, mode: str) -> None:
     if done.returncode != 0 or not target.is_file():
         raise ToolError("Hyper Compress: " + last_line(done))
     if "SIGNED_SKIP" in (done.stderr or ""):
-        raise ToolError("PDF: Hyper Compress обнаружил электронную подпись")
+        raise ToolError("PDF: Hyper Compress found a digital signature")
 
 
 def _make_ghostscript(source: Path, target: Path, dpi: int, qfactor: float) -> None:
@@ -109,7 +109,7 @@ def _make_ghostscript(source: Path, target: Path, dpi: int, qfactor: float) -> N
 
 # ----------------------------------------------------------- orchestration --
 
-ALREADY = "уже оптимизирован"
+ALREADY = "already optimized"
 
 
 class _Run:
@@ -144,7 +144,7 @@ class _Run:
 
     def fail(self, name: str, reason) -> None:
         self.errors.append(f"{name}: {reason}")
-        self.log(f"{name}: отклонён — {reason}")
+        self.log(f"{name}: rejected - {reason}")
 
     # -- the lossless stage ------------------------------------------------
 
@@ -166,7 +166,7 @@ class _Run:
                                       content=True, metadata=True)
                 self.verify(candidate)
                 candidate.verified = True
-                self.log(f"{label}: {candidate.size} байт ({', '.join(report.notes) or '—'})")
+                self.log(f"{label}: {candidate.size} bytes ({', '.join(report.notes) or '-'})")
                 return candidate
             except Exception as exc:
                 self.fail(label, exc)
@@ -182,13 +182,13 @@ class _Run:
         if candidate.exact_pages and not identical_pages(
                 self.path, candidate.path, candidate.exact_pages,
                 self.directory("exact"), self.jobs):
-            raise ValueError("PDF: отрисовка изменилась в режиме без потерь")
+            raise ValueError("PDF: rendering changed in lossless mode")
         if candidate.gate_pages is None or candidate.gate_pages:
             pages = (list(range(1, len(self.baseline.pages) + 1))
                      if candidate.gate_pages is None else candidate.gate_pages)
             bad = self.visual_gate().failures(candidate.path, pages, stop_early=True)
             if bad:
-                raise ValueError(f"страница {bad[0]} ниже SSIM {self.min_ssim:.2f}")
+                raise ValueError(f"page {bad[0]} is below SSIM {self.min_ssim:.2f}")
 
     # -- lossy engines -----------------------------------------------------
 
@@ -211,7 +211,7 @@ class _Run:
                     jpegopt.revert(change)
                 else:
                     kept.append(change)
-            self.log(f"JPEG: возвращены картинки страниц {sorted(bad)[:8]}")
+            self.log(f"JPEG: images restored on pages {sorted(bad)[:8]}")
             if not kept:
                 return False
             lossless.save(pdf, target, deflated=True)
@@ -310,7 +310,7 @@ def _timed(log: Log | None) -> Log:
     start = time.monotonic()
     if log is None:
         return lambda message: None
-    return lambda message: log(f"{time.monotonic() - start:6.1f} с  {message}")
+    return lambda message: log(f"{time.monotonic() - start:6.1f} s  {message}")
 
 
 def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
@@ -347,9 +347,9 @@ def _decrypted(path: Path, directory: Path) -> Path:
             pdf.save(copy, compress_streams=False)   # the stages do the compressing
             return copy
     except pikepdf.PasswordError as exc:
-        raise Skipped("нужен пароль") from exc
+        raise Skipped("password required") from exc
     except (pikepdf.PdfError, OSError) as exc:
-        raise ValueError(f"PDF: не удалось прочитать исходник: {exc}") from exc
+        raise ValueError(f"PDF: cannot read the source: {exc}") from exc
 
 
 def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: float,
@@ -359,13 +359,13 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
     if mrc_ssim is None:
         mrc_ssim = min_ssim - MRC_ALLOWANCE if min_ssim < 1.0 else min_ssim
     if mode not in ("lossless", "lossy"):
-        raise ValueError(f"PDF: неизвестный режим: {mode}")
+        raise ValueError(f"PDF: unknown mode: {mode}")
     jobs = max(1, jobs or os.cpu_count() or 1)
     log = _timed(log)
     source_stat = path.stat()
     with open_pdf(work) as pdf:
         if has_signature(pdf):
-            raise Skipped("документ с электронной подписью не изменён")
+            raise Skipped("the document has a digital signature and is left unchanged")
         marker = read_marker(pdf)
         baseline = Fingerprint.read(pdf, work)
     lossy = mode == "lossy"
@@ -373,9 +373,9 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
         return ALREADY, 0
     worker = find_worker()
     if lossy and which("pdftoppm") is None:
-        raise ValueError("PDF: для проверки результата нужен pdftoppm")
+        raise ValueError("PDF: pdftoppm is needed to check the result")
     if worker is not None and which("pdftoppm") is None:
-        raise ValueError("PDF: для проверки Hyper Compress нужен pdftoppm")
+        raise ValueError("PDF: pdftoppm is needed to check Hyper Compress")
 
     with tempfile.TemporaryDirectory(prefix=".pdfopt-", dir=path.parent) as directory:
         scratch = Path(directory)
@@ -410,19 +410,19 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
         if best is None:
             if not candidates and state.errors:
                 raise ValueError("PDF: " + "; ".join(state.errors))
-            return "без изменений", 0
+            return "no change", 0
         final = _stamp(best, lossy, scratch)
         size = final.stat().st_size
         if size >= source_stat.st_size:
-            return "без изменений", 0
+            return "no change", 0
         saving = source_stat.st_size - size
         if dry_run:
-            return f"возможная экономия ({best.name})", saving
+            return f"possible saving ({best.name})", saving
         current = path.stat()
         if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
                 source_stat.st_dev, source_stat.st_ino, source_stat.st_size,
                 source_stat.st_mtime_ns):
-            raise ValueError("исходный файл изменился во время обработки")
+            raise ValueError("the source file changed during processing")
         shutil.copystat(path, final)   # mode, times and extended attributes
         if hasattr(os, "chown") and (current.st_uid, current.st_gid) != (
                 os.getuid(), os.getgid()):
@@ -430,4 +430,4 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
             with contextlib.suppress(PermissionError):
                 os.chown(final, current.st_uid, current.st_gid)
         os.replace(final, path)
-        return f"сжато ({best.name})", saving
+        return f"compressed ({best.name})", saving

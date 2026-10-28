@@ -60,7 +60,7 @@ def _plane_ssim(first: np.ndarray, second: np.ndarray) -> tuple[float, int]:
 def ssim(first: np.ndarray, second: np.ndarray) -> float:
     """Mean SSIM of two uint8 images of equal shape (H, W) or (H, W, C)."""
     if first.shape != second.shape:
-        raise ValueError("SSIM: размеры изображений различаются")
+        raise ValueError("SSIM: image sizes differ")
     if first.ndim == 2:
         first, second = first[:, :, None], second[:, :, None]
     total = 0.0

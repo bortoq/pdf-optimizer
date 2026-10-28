@@ -103,7 +103,7 @@ class StructureTests(unittest.TestCase):
             self.assertLessEqual(packed.stat().st_size, plain.stat().st_size)
 
 
-@unittest.skipUnless(lossless.ect_available(), "модуль ECT не собран")
+@unittest.skipUnless(lossless.ect_available(), "the ECT module is not built")
 class EctTests(unittest.TestCase):
     def test_zlib_wrapper_decodes_and_beats_zlib(self):
         data = (b"pdfopt " * 500 + bytes(range(256)) * 20) * 3
@@ -263,7 +263,7 @@ class ImageTests(unittest.TestCase):
         self.assertTrue(np.array_equal(inverted, ~rows))
 
 
-@unittest.skipUnless(need("jbig2", "pdftoppm"), "нужны jbig2 и pdftoppm")
+@unittest.skipUnless(need("jbig2", "pdftoppm"), "jbig2 and pdftoppm are needed")
 class Jbig2Tests(unittest.TestCase):
     def check(self, kind, mask):
         with tempfile.TemporaryDirectory() as root:
@@ -331,7 +331,7 @@ class JpegTests(unittest.TestCase):
             self.assertNotIn("jpeg×1", report.notes)
 
 
-@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class VisualExactnessTests(unittest.TestCase):
     def test_changed_pages_render_identically(self):
         gray = stripes(gray=True)

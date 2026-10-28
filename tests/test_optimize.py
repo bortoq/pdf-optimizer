@@ -52,10 +52,10 @@ class LosslessTests(unittest.TestCase):
             original = book.read_bytes()
             status, saved = optimize_pdf(book, "lossless", dry_run=True, jobs=2)
             self.assertGreater(saved, 0)
-            self.assertIn("возможная экономия", status)
+            self.assertIn("possible saving", status)
             self.assertEqual(book.read_bytes(), original)
             status, saved = optimize_pdf(book, "lossless", jobs=2)
-            self.assertIn("сжато", status)
+            self.assertIn("compressed", status)
             self.assertEqual(book.stat().st_size, len(original) - saved)
             with open_pdf(book) as pdf:
                 self.assertEqual(len(pdf.pages), 1)
@@ -70,9 +70,9 @@ class LosslessTests(unittest.TestCase):
             with open_pdf(book) as pdf:
                 self.assertEqual(read_marker(pdf)[1], False)
             self.assertEqual(optimize_pdf(book, "lossless", jobs=2),
-                             ("уже оптимизирован", 0))
+                             ("already optimized", 0))
             status, _ = optimize_pdf(book, "lossless", force=True, jobs=2)
-            self.assertEqual(status, "без изменений")
+            self.assertEqual(status, "no change")
 
     def test_metadata_and_page_text_are_preserved(self):
         with tempfile.TemporaryDirectory() as root:
@@ -126,7 +126,7 @@ class LosslessTests(unittest.TestCase):
 
             with self.assertRaises(ValueError) as caught:
                 optimize_pdf(book, "lossless", jobs=2, log=log)
-            self.assertIn("изменился", str(caught.exception))
+            self.assertIn("changed", str(caught.exception))
             self.assertTrue(book.read_bytes().endswith(b"%changed\n"))
 
     def test_no_temporary_files_are_left_behind(self):
@@ -137,7 +137,7 @@ class LosslessTests(unittest.TestCase):
             self.assertEqual([p.name for p in Path(root).iterdir()], ["book.pdf"])
 
 
-@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class FallbackTests(unittest.TestCase):
     def test_without_a_renderer_image_rewrites_are_dropped_not_the_file(self):
         gray = stripes(gray=True)
@@ -145,7 +145,7 @@ class FallbackTests(unittest.TestCase):
             book = Path(root) / "rgb.pdf"
             make_flate_image_pdf(book, np.stack([gray] * 3, axis=2))
             before = book.stat().st_size
-            with patch("pdfopt.render.require", side_effect=ToolError("pdftoppm не найден")):
+            with patch("pdfopt.render.require", side_effect=ToolError("pdftoppm not found")):
                 status, saved = optimize_pdf(book, "lossless", jobs=2)
             self.assertIn("lossless-safe", status)
             with open_pdf(book) as pdf:
@@ -174,9 +174,9 @@ class WorkerTests(unittest.TestCase):
             worker = worker_script(Path(root) / "w", "import sys; sys.exit(3)")
             with patch("pdfopt.optimize.find_worker", return_value=worker):
                 status, _ = optimize_pdf(book, "lossless", jobs=1)
-            self.assertIn("сжато", status)
+            self.assertIn("compressed", status)
 
-    @unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+    @unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
     def test_lossless_worker_output_is_verified(self):
         with tempfile.TemporaryDirectory() as root:
             book = Path(root) / "book.pdf"
@@ -195,7 +195,7 @@ class WorkerTests(unittest.TestCase):
                 self.assertIsNone(read_marker(pdf))
 
 
-@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class LossyTests(unittest.TestCase):
     def test_scan_is_layered_and_text_survives(self):
         with tempfile.TemporaryDirectory() as root:
@@ -216,10 +216,10 @@ class LossyTests(unittest.TestCase):
             make_scan_pdf(book)
             optimize_pdf(book, "lossy", min_ssim=0.96, jobs=2)
             self.assertEqual(optimize_pdf(book, "lossy", min_ssim=0.96, jobs=2),
-                             ("уже оптимизирован", 0))
+                             ("already optimized", 0))
             # A lossless pass over a lossy file is also pointless.
             self.assertEqual(optimize_pdf(book, "lossless", jobs=2),
-                             ("уже оптимизирован", 0))
+                             ("already optimized", 0))
 
     def test_lossless_marked_file_still_gets_the_lossy_pass(self):
         with tempfile.TemporaryDirectory() as root:
@@ -229,7 +229,7 @@ class LossyTests(unittest.TestCase):
             with open_pdf(book) as pdf:
                 self.assertEqual(read_marker(pdf)[1], False)
             status, _ = optimize_pdf(book, "lossy", min_ssim=0.96, jobs=2)
-            self.assertIn("сжато", status)
+            self.assertIn("compressed", status)
 
     def test_unreachable_quality_keeps_the_lossless_result(self):
         with tempfile.TemporaryDirectory() as root:
@@ -248,7 +248,7 @@ class LossyTests(unittest.TestCase):
                                          mrc_ssim=mrc_ssim, jobs=2)
                 sizes[mrc_ssim] = (status, book.stat().st_size)
             self.assertNotIn("MRC", sizes[0.96][0])
-            self.assertEqual(sizes[None][0], "сжато (MRC)")
+            self.assertEqual(sizes[None][0], "compressed (MRC)")
             self.assertLess(sizes[None][1] * 5, sizes[0.96][1])
 
     def test_default_threshold_constant(self):
@@ -281,10 +281,10 @@ class RobustnessTests(unittest.TestCase):
             make_scan_pdf(book, pages=2, varied=True)
             with patch("pdfopt.optimize._Run.jpeg_stage", side_effect=RuntimeError("bug")):
                 status, _ = optimize_pdf(book, "lossy", min_ssim=0.9, jobs=1)
-            self.assertEqual(status, "сжато (MRC)")
+            self.assertEqual(status, "compressed (MRC)")
 
 
-@unittest.skipUnless(need("pdftoppm"), "pdftoppm не установлен")
+@unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class JpegRollbackTests(unittest.TestCase):
     def test_images_of_rejected_pages_are_put_back(self):
         with tempfile.TemporaryDirectory() as root:
@@ -312,7 +312,7 @@ class JpegRollbackTests(unittest.TestCase):
                                   for p in pdf.pages], originals)
 
 
-@unittest.skipUnless(need("gs", "pdftoppm"), "Ghostscript не установлен")
+@unittest.skipUnless(need("gs", "pdftoppm"), "Ghostscript is not installed")
 class GhostscriptTests(unittest.TestCase):
     def runs(self, ocr: bool) -> list:
         import pdfopt.optimize as optimize
