@@ -1,21 +1,41 @@
 name: release
-# Tag vX.Y.Z -> wheels for Linux/macOS/Windows + sdist -> PyPI (trusted publishing:
-# add this repository as a trusted publisher of the "pdfopt" project on pypi.org).
+# Tag vX.Y.Z -> tests -> wheels for Linux/macOS/Windows + sdist -> PyPI (trusted
+# publishing: add this repository as a trusted publisher of the "pdfopt" project
+# on pypi.org).
 on:
   push:
     tags: ["v*"]
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      PDFOPT_REQUIRE_ECT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils libopenjp2-tools ghostscript ffmpeg
+      - run: sudo apt-get install -y jbig2 || echo "jbig2enc is not available"
+      - run: pip install -e '.[dev]'
+      - run: ruff check . && mypy && pytest -q
   wheels:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # x86-64 and ARM Linux, ARM and Intel macOS, Windows
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: pypa/cibuildwheel@v2.21.3
+      - uses: pypa/cibuildwheel@v3.4.1
         env:
-          CIBW_BUILD: "cp311-* cp312-* cp313-*"
+          CIBW_BUILD: "cp311-* cp312-* cp313-* cp314-*"
           CIBW_SKIP: "*-musllinux_* *-win32 *_i686"
+          # A wheel without the ECT module must not be published.
+          CIBW_ENVIRONMENT: "PDFOPT_REQUIRE_ECT=1"
+          CIBW_TEST_COMMAND: >-
+            python -c "import pdfopt._ectdeflate as e, zlib;
+            assert zlib.decompress(e.deflate(b'pdfopt' * 500), -15) == b'pdfopt' * 500"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}
@@ -30,7 +50,7 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
   publish:
-    needs: [wheels, sdist]
+    needs: [test, wheels, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

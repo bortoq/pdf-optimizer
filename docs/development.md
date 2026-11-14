@@ -5,6 +5,7 @@
 ```
 pdfopt/
   cli.py        arguments, file discovery, parallelism across files
+  cache.py      files known to gain nothing (user's cache folder)
   optimize.py   orchestrator: stages, candidates, verification, marker, atomic replace
   lossless.py   lossless passes (structure, images, JPEG, ECT, save)
   fonts.py      TrueType subsetting
@@ -22,7 +23,11 @@ pdfopt/
 ```sh
 pytest
 ruff check .
+mypy
 ```
+
+The tests use a throwaway cache folder (`tests/__init__.py` sets
+`XDG_CACHE_HOME`), so they neither read nor change your own.
 
 CI runs the tests on Linux, macOS and Windows. Tests that need `pdftoppm`,
 `jbig2`, `ffmpeg`, `gs` or OpenJPEG are skipped when the program is missing.

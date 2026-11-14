@@ -30,7 +30,7 @@ def components(colorspace) -> int | None:
         kind = str(colorspace[0])
         if kind == "/ICCBased":
             try:
-                return int(colorspace[1].get("/N"))
+                return int(colorspace[1].get("/N"))  # type: ignore[arg-type]
             except (TypeError, ValueError, pikepdf.PdfError):
                 return None
         if kind == "/Indexed":

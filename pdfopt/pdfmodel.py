@@ -10,6 +10,8 @@ import re
 
 import pikepdf
 
+from .tools import ToolError, last_line, require, run
+
 MARKER_KEY = "/PdfOpt"
 MARKER_VERSION = 1
 MRC_FORM_KEY = "/PdfOptLayers"
@@ -50,8 +52,17 @@ def has_signature(pdf: pikepdf.Pdf) -> bool:
                and "/ByteRange" in obj for obj in pdf.objects)
 
 
+MAX_TREE_DEPTH = 64     # page trees are a few levels deep; a longer chain is a loop
+
+
 def _inherited(node, key: str, default=None):
-    while node is not None:
+    """An inheritable page attribute, looked up through ``/Parent``.
+
+    A damaged file may link ``/Parent`` in a circle, so the climb is bounded.
+    """
+    for _ in range(MAX_TREE_DEPTH):
+        if not isinstance(node, pikepdf.Dictionary):
+            break
         if key in node:
             return node[key]
         node = node.get("/Parent")
@@ -114,6 +125,25 @@ def _box(value) -> tuple[float, ...] | None:
     return tuple(round(float(v), 2) for v in value)
 
 
+# Document-level features a rewrite by an external engine may drop; a candidate
+# has to keep every one the source has (their presence is compared).
+CATALOG_KEYS = ("/Outlines", "/PageLabels", "/Lang", "/ViewerPreferences",
+                "/OutputIntents", "/StructTreeRoot", "/MarkInfo", "/OCProperties",
+                "/PageLayout", "/PageMode", "/OpenAction")
+
+_PDFA_PART = re.compile(rb"pdfaid:part\s*(?:=\s*[\"']|>)\s*(\d)")
+
+
+def pdfa_part(pdf: pikepdf.Pdf) -> int | None:
+    """The PDF/A part the XMP metadata claims (1, 2, 3...), or None."""
+    try:
+        xmp = pdf.Root.get("/Metadata")
+        found = _PDFA_PART.search(bytes(xmp.read_bytes())) if xmp is not None else None
+    except (pikepdf.PdfError, ValueError, TypeError, AttributeError):
+        return None
+    return int(found.group(1)) if found else None
+
+
 @dataclass(frozen=True)
 class PageFacts:
     box: tuple | None
@@ -132,6 +162,8 @@ class Fingerprint:
     pages: tuple[PageFacts, ...]
     metadata: tuple
     interactive: bool
+    catalog: frozenset = frozenset()     # CATALOG_KEYS the document has
+    pdfa: int | None = None              # the PDF/A part it claims
     _text: tuple | None = field(default=None, repr=False)
 
     @classmethod
@@ -154,7 +186,8 @@ class Fingerprint:
         root = pdf.Root
         interactive = ("/AcroForm" in root or "/Names" in root or
                        any(page.annotations for page in pages))
-        return cls(path, tuple(pages), metadata, interactive)
+        catalog = frozenset(key for key in CATALOG_KEYS if key in root)
+        return cls(path, tuple(pages), metadata, interactive, catalog, pdfa_part(pdf))
 
     @property
     def has_text_layer(self) -> bool:
@@ -171,11 +204,15 @@ class Fingerprint:
 
 
 def _text_digests(path: Path) -> tuple:
-    from pypdf import PdfReader
-    with path.open("rb") as stream:
-        reader = PdfReader(stream, strict=False)
-        return tuple(hashlib.sha256((page.extract_text() or "").encode("utf-8")).digest()
-                     for page in reader.pages)
+    """A digest of the text of every page, as poppler's ``pdftotext`` reads it
+    (pages end with a form feed)."""
+    done = run([require("pdftotext"), "-enc", "UTF-8", str(path), "-"], binary=True)
+    if done.returncode != 0:
+        raise ToolError("pdftotext: " + last_line(done))
+    pages = done.stdout.split(b"\f")
+    if pages and not pages[-1].strip():
+        pages.pop()
+    return tuple(hashlib.sha256(b" ".join(page.split())).digest() for page in pages)
 
 
 def compare(candidate: Fingerprint, baseline: Fingerprint, *,
@@ -199,6 +236,9 @@ def compare(candidate: Fingerprint, baseline: Fingerprint, *,
             raise ValueError("PDF: page content changed in lossless mode")
         if candidate.text() != baseline.text():
             raise ValueError("PDF: page text changed")
+    lost = sorted(baseline.catalog - candidate.catalog)
+    if lost:
+        raise ValueError("PDF: the document lost " + ", ".join(key[1:] for key in lost))
     if metadata and candidate.metadata != baseline.metadata:
         raise ValueError("PDF: metadata changed in lossless mode")
 
@@ -209,15 +249,32 @@ def read_marker(pdf: pikepdf.Pdf) -> tuple[int, bool] | None:
         return None
     try:
         return int(marker.get("/Version", 0)), bool(marker.get("/Lossy", False))
-    except (TypeError, ValueError, pikepdf.PdfError):
+    except (TypeError, ValueError, AttributeError, pikepdf.PdfError):
         return None
 
 
-def set_marker(pdf: pikepdf.Pdf, lossy: bool) -> None:
+def marker_quality(pdf: pikepdf.Pdf) -> int | None:
+    """The ``-q`` value (percent) a lossy file was made with, if recorded."""
+    marker = pdf.Root.get(MARKER_KEY)
+    try:
+        value = marker.get("/Quality") if marker is not None else None
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, AttributeError, pikepdf.PdfError):
+        return None
+
+
+def set_marker(pdf: pikepdf.Pdf, lossy: bool, quality: int | None = None) -> None:
+    """Mark the document as optimized. ``quality`` is the ``-q`` percent of a
+    lossy run; the lowest one the file ever went through is kept."""
     previous = read_marker(pdf)
+    earlier = marker_quality(pdf)
     lossy = lossy or bool(previous and previous[1])
-    pdf.Root[MARKER_KEY] = pikepdf.Dictionary(
-        Version=MARKER_VERSION, Lossy=lossy)
+    marker = pikepdf.Dictionary(Version=MARKER_VERSION, Lossy=lossy)
+    if lossy and quality is not None:
+        marker.Quality = min(quality, earlier) if earlier is not None else quality
+    elif earlier is not None:
+        marker.Quality = earlier
+    pdf.Root[MARKER_KEY] = marker
 
 
 def resources_images(resources, cache: dict, active: set) -> list:
@@ -226,7 +283,7 @@ def resources_images(resources, cache: dict, active: set) -> list:
     Forms created by the MRC stage are skipped so lossy passes never touch
     their own layers twice.
     """
-    found = []
+    found: list = []
     xobjects = resources.get("/XObject") if resources is not None else None
     if xobjects is None:
         return found

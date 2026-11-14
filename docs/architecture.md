@@ -34,7 +34,7 @@ really have changed is checked.
 - `pdfmodel.Fingerprint` holds MediaBox/CropBox/Rotate, the annotation count and
   the SHA-256 of the decoded content streams of every page. The lossless passes
   and MRC/JPEG do not touch content streams, so the comparison is a fast byte
-  comparison. Text extraction (`pypdf`, slow) is needed only when the content
+  comparison. Text extraction (`pdftotext`, slow) is needed only when the content
   changed (Ghostscript, Hyper) and is computed lazily. The fingerprint also
   records whether a page has text: a `BT` operator in the page content or in its
   forms (unused fonts in the resources do not count; an unreadable stream counts
@@ -184,14 +184,39 @@ Pages get their own resource dictionaries (copies), so shared or inherited
   retrying rejected pages with a target raised by the measured error (the
   background does not make up for that error).
 - **The `/PdfOpt` marker** lives in the Catalog, not in Info, so the lossless
-  metadata check is not disturbed. A file that gained nothing gets no marker and
-  is analysed again next time.
+  metadata check is not disturbed. It holds `/Version`, `/Lossy` and, for lossy
+  files, `/Quality` (the lowest `-q` the file went through); a lower `-q` takes
+  the file again. A file that gained nothing gets no marker (it is not
+  rewritten); `cache.py` remembers it by the SHA-256 of its content together
+  with the settings, the pdfopt version and the external programs found. Workers
+  only read the cache; the parent process writes it once at the end.
+- **PDF/A-1** (`pdfaid:part` 1 in the XMP) is PDF 1.4: `lossless.save` keeps the
+  classic file structure (no object or xref streams, so the version is not
+  raised), MRC does not use JPEG 2000, and Ghostscript is not offered to PDF/A of
+  any part. Conformance is not validated; the forbidden features are avoided.
+- **Document-level features.** `Fingerprint.catalog` lists which of the Catalog
+  entries in `CATALOG_KEYS` the source has; a candidate missing one is rejected.
+  The pikepdf passes never touch them, so this guards the engines that rewrite
+  the file. Plain settings Ghostscript drops are copied back
+  (`_keep_document_settings`).
+- **Damaged files.** `_process` turns any exception of a file into its `error:`
+  line; the climb through `/Parent` is bounded (`MAX_TREE_DEPTH`), a loop there
+  used to hang the run.
+- **Interrupting.** Ctrl+C reaches every process of the terminal's group;
+  `SIGTERM` reaches only the parent, which passes it on to its workers. Both
+  unwind through the `TemporaryDirectory` blocks.
+- **Replacing.** The new file is `fsync`ed, renamed over the source, and the
+  folder is `fsync`ed. The rename gives the file a new inode: other hard links
+  to the source keep the old content. The modification time of the source is
+  kept on purpose (`copystat`), so tools that look only at the time, not the
+  size, do not see the change.
 - **Not processed:** signed PDFs, password-protected files (files that open
   without a password only with `--decrypt`; the result has no encryption),
   CMYK/Indexed JPEG, images with `/Decode` or colour-key masks in lossy mode,
   inline images, images inside forms when the dpi is determined.
 - **Disk:** the work folder is created next to the file (for an atomic
-  replace); with `-q` the reference renderings take about 1 MB per page.
+  replace); with `-q` the reference renderings take about 1 MB per page. A dry
+  run in a read-only folder uses the system's temporary folder.
 - **Memory:** MRC pages are decoded whole (about 25 MB per A4 page at 300 dpi in
   numpy arrays, several copies); at most `2·jobs` pages are processed at once.
   Images above 512 MB unpacked (`MAX_SAMPLE_BYTES`) are skipped, and plain Flate

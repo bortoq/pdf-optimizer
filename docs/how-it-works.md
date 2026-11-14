@@ -43,6 +43,7 @@ passes wins.
 | Check | When |
 | --- | --- |
 | page count, MediaBox/CropBox, rotation, annotation count | always |
+| outlines, page labels, language, viewer preferences, output intents, structure tree, layers are still there | always |
 | content stream of every page byte for byte (else text compare) | lossless |
 | metadata (Info and XMP) | lossless |
 | rendering identical at 100 dpi on changed pages | lossless, when images or fonts changed |
@@ -51,4 +52,9 @@ passes wins.
 SSIM is computed in-process (numpy) with FFmpeg's `ssim` formula.
 
 A marker (`/Root /PdfOpt`) keeps a second run from recompressing a file; `--force`
-overrides it.
+overrides it. It records the `-q` of a lossy run, and a lower `-q` processes the
+file again. A file that gained nothing is not rewritten and gets no marker; it
+is remembered in the user's cache folder instead.
+
+Files that claim PDF/A-1 are saved without object streams, xref streams and
+JPEG 2000 (PDF/A-1 forbids them) and are never given to Ghostscript.

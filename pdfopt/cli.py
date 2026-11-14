@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+import contextlib
 import multiprocessing
 import os
 from pathlib import Path
@@ -11,11 +12,12 @@ import queue
 import shutil
 import signal
 import sys
+import tempfile
 import time
 
-from . import __version__
+from . import __version__, cache
 from .lossless import ect_available
-from .optimize import ALREADY, MIN_SSIM, MRC_ALLOWANCE, find_worker, optimize_pdf
+from .optimize import ALREADY, MIN_SSIM, MRC_ALLOWANCE, Outcome, find_worker, optimize_pdf
 from .pdfmodel import Skipped
 
 
@@ -54,6 +56,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+WORK_PREFIX = ".pdfopt-"     # work folders and unfinished -o files
+
+
 def discover(paths: list[Path], recursive: bool,
              rejected: list[str] | None = None) -> list[Path]:
     """Collect unique regular PDF files, skipping symlinks.
@@ -85,8 +90,11 @@ def discover(paths: list[Path], recursive: bool,
         elif target.is_dir():
             if recursive:
                 for directory, dirs, files in os.walk(target, followlinks=False):
+                    # Not into links, nor into work folders (.pdfopt-*) that a
+                    # killed run left behind or another run is using.
                     dirs[:] = sorted(name for name in dirs
-                                     if not (Path(directory) / name).is_symlink())
+                                     if not name.startswith(WORK_PREFIX)
+                                     and not (Path(directory) / name).is_symlink())
                     for name in sorted(files):
                         add(Path(directory) / name)
             else:
@@ -130,31 +138,52 @@ def files_at_once(cores: int, files: int, mode: str,
 _PROGRESS = None   # in a worker process: the queue that carries progress to the parent
 
 
+_KNOWN: set[str] = set()   # keys of the files known to gain nothing (see cache.py)
+NO_GAIN = "no change"
+NO_GAIN_KNOWN = "no change (known from an earlier run; --force tries again)"
+
+
 class _Interrupted(BaseException):
-    """Ctrl+C reached a worker; unwinds it quietly (temporary files are removed)."""
+    """Ctrl+C or a termination request; unwinds quietly (temporary files are removed)."""
 
 
 def _stop(signum, frame) -> None:
+    # Once is enough: a second signal must not break the clean-up.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise _Interrupted
 
 
-def _init_worker(channel) -> None:
+_TERMINATED = False
+
+
+def _terminated(signum, frame) -> None:
+    global _TERMINATED
+    _TERMINATED = True
+    raise KeyboardInterrupt
+
+
+def _init_worker(channel, known: set[str]) -> None:
     global _PROGRESS
     _PROGRESS = channel
+    _KNOWN.update(known)
     # The terminal sends Ctrl+C to every process; the parent reports it, the
     # workers just stop. Programs started by a worker get the default action.
     signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
 
 
-def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None]:
-    """Worker: returns (path, outcome, saved, text, quality); never raises.
+def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | None]:
+    """Worker: returns (path, outcome, saved, text, quality, key); never raises.
 
     ``quality`` is (pages, sum of page SSIM, lowest page SSIM) or None.
+    ``key`` is set when the file gained nothing: the parent records it, and
+    the next run with the same settings does not repeat the work.
     ``emit(path, fraction)`` is told how far the file is; in a worker process
     that goes to the parent through the progress queue.
     """
     (path, mode, dry_run, min_ssim, mrc_ssim, jobs, force, safe_text, verbose,
-     decrypt, output) = task
+     decrypt, output, settings) = task
     if emit is None and _PROGRESS is not None:
         def emit(name: str, fraction: float) -> None:
             _PROGRESS.put((name, fraction))
@@ -171,31 +200,59 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None]:
             emit(str(path), fraction)
 
     work = path
+
+    def deliver() -> None:
+        """Give the finished copy its name (replaces an older output file)."""
+        if work != path:
+            os.replace(work, output)
+
+    def discard() -> None:
+        # An output file that was there before the run stays as it was.
+        if work != path:
+            work.unlink(missing_ok=True)
+
     try:
+        key = None
+        if not force:
+            with contextlib.suppress(OSError):
+                key = cache.file_key(path, settings)
         if output is not None and not dry_run:
             # Work on a copy: the source stays as it is. The copy is also the
-            # result of files that need no change or are skipped.
+            # result of files that need no change or are skipped. It gets the
+            # name of the output only when it is complete.
             output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, output)
-            work = output
-        outcome = optimize_pdf(work, mode, dry_run=dry_run, min_ssim=min_ssim,
-                               jobs=jobs, force=force, safe_text=safe_text,
-                               mrc_ssim=mrc_ssim, decrypt=decrypt, log=log,
-                               progress=progress)
+            handle, name = tempfile.mkstemp(prefix=WORK_PREFIX, suffix=".pdf",
+                                            dir=output.parent)
+            os.close(handle)
+            work = Path(name)
+            shutil.copy2(path, work)
+        if key is not None and key in _KNOWN:
+            outcome = Outcome(NO_GAIN_KNOWN, 0)
+        else:
+            outcome = optimize_pdf(work, mode, dry_run=dry_run, min_ssim=min_ssim,
+                                   jobs=jobs, force=force, safe_text=safe_text,
+                                   mrc_ssim=mrc_ssim, decrypt=decrypt, log=log,
+                                   progress=progress)
         status, saved = outcome
         scores = getattr(outcome, "scores", ())
         quality = (len(scores), sum(scores), min(scores)) if scores else None
-        return str(path), "ok", saved, status, quality
+        deliver()
+        return str(path), "ok", saved, status, quality, key if status == NO_GAIN else None
     except (KeyboardInterrupt, _Interrupted):
-        if work != path:
-            work.unlink(missing_ok=True)
-        return str(path), "interrupted", 0, "interrupted", None
+        discard()
+        return str(path), "interrupted", 0, "interrupted", None, None
     except Skipped as exc:
-        return str(path), "skipped", 0, f"skipped: {exc}", None
-    except (OSError, ValueError) as exc:
-        if work != path:
-            work.unlink(missing_ok=True)
-        return str(path), "failed", 0, f"error: {exc}", None
+        try:
+            deliver()
+        except OSError as error:
+            discard()
+            return str(path), "failed", 0, f"error: {error}", None, None
+        return str(path), "skipped", 0, f"skipped: {exc}", None, None
+    except Exception as exc:    # a damaged file must not stop the other files
+        discard()
+        text = str(exc) if isinstance(exc, (OSError, ValueError)) else \
+            f"unexpected {type(exc).__name__}: {exc}"
+        return str(path), "failed", 0, f"error: {text}", None, None
 
 
 def _size(path: Path) -> int:
@@ -246,6 +303,11 @@ class _Bar:
         if self.shown:
             print("\r", end="\033[K", file=sys.stderr, flush=True)
             self.shown = False
+
+
+def _main_thread() -> bool:
+    import threading
+    return threading.current_thread() is threading.main_thread()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -299,8 +361,14 @@ def main(argv: list[str] | None = None) -> int:
     cores = args.jobs or os.cpu_count() or 1
     parallel = files_at_once(cores, len(paths), mode)
     per_file = max(1, cores // parallel)
+    settings = cache.settings_key(mode, min_ssim, mrc_ssim, args.safe_text, args.decrypt)
+    no_gain = set() if args.force else cache.load()
+    _KNOWN.clear()
+    _KNOWN.update(no_gain)
+    gained_nothing: list[str] = []
     tasks = [(path, mode, args.dry_run, min_ssim, mrc_ssim, per_file, args.force,
-              args.safe_text, args.verbose, args.decrypt, targets[path]) for path in paths]
+              args.safe_text, args.verbose, args.decrypt, targets[path], settings)
+             for path in paths]
     sizes = {str(path): _size(path) for path in paths}
     weight = sum(sizes.values()) or 1
     failures = skipped = known = total_saved = done_size = done = 0
@@ -324,7 +392,9 @@ def main(argv: list[str] | None = None) -> int:
     def report(result) -> None:
         nonlocal failures, skipped, known, total_saved, done_size, done
         nonlocal pages, ssim_sum, lowest
-        name, outcome, saved, text, quality = result
+        name, outcome, saved, text, quality, key = result
+        if key is not None:
+            gained_nothing.append(key)
         if outcome == "interrupted":
             interrupted.append(name)
             return
@@ -351,11 +421,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if bar:
         bar.draw(0.0, 0, 0, 0, "", force=True)
+    # A termination request (kill, docker stop, timeout) ends the run like
+    # Ctrl+C: work folders are removed and the sources stay unchanged.
+    global _TERMINATED
+    _TERMINATED = False
+    previous = signal.signal(signal.SIGTERM, _terminated) if _main_thread() else None
     try:
         if parallel > 1:
-            channel = multiprocessing.Queue()
+            channel: multiprocessing.Queue = multiprocessing.Queue()
             with ProcessPoolExecutor(max_workers=parallel, initializer=_init_worker,
-                                     initargs=(channel,)) as pool:
+                                     initargs=(channel, no_gain)) as pool:
                 running = {pool.submit(_process, task) for task in tasks}
                 try:
                     while running:
@@ -373,6 +448,12 @@ def main(argv: list[str] | None = None) -> int:
                 except KeyboardInterrupt:
                     for future in running:
                         future.cancel()
+                    if _TERMINATED:
+                        # Unlike Ctrl+C, a termination request reaches only
+                        # this process: pass it on.
+                        for worker in list((getattr(pool, "_processes", None) or {}).values()):
+                            with contextlib.suppress(OSError, ValueError):
+                                worker.terminate()
                     # Workers were stopped by the same Ctrl+C; collect them.
                     for future in wait(running)[0]:
                         if not future.cancelled():
@@ -389,6 +470,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"pdfopt: interrupted, {done} of {len(paths)} files "
               "finished; the others are unchanged", file=sys.stderr)
         return 130
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+        cache.add(gained_nothing)
     if bar:
         bar.clear()
     print(f"Saved: {_human(total_saved)} ({_percent(total_saved, done_size)})" +

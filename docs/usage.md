@@ -21,7 +21,7 @@ python3 -m pdfopt --help
 | `-o`, `--output PATH` | leave sources alone: write the result to a file (one input) or a directory (several); unchanged and skipped files are copied as they are |
 | `-j`, `--jobs N` | cores to use (default: all) |
 | `--version` | print the version |
-| `--force` | process a file even if it is already optimized |
+| `--force` | process a file even if it is already optimized or is known to gain nothing |
 | `--safe-text` | with `-q`, code text masks without JBIG2 symbol mode (larger, but similar letters can never be swapped) |
 | `--mrc-quality N` | minimum SSIM of MRC text pages (default 6 below `-q`; 100 with `-q 100`) |
 
@@ -35,5 +35,14 @@ shows the mean SSIM of the new pages against the sources and the lowest page,
 for example `Saved: 281.0 MB (87.1%) SSIM 0.9983 (lowest page 0.9712)`. Signed PDFs and password-protected files are
 **skipped** (`skipped: ...`), which is not an error; files encrypted without a
 password are processed only with `--decrypt`. Already optimized files are
-counted in the total. When several files run at once, their number is bounded
+counted in the total. A lossy file is processed again only with a lower `-q`
+than it was made with. Files that gained nothing are remembered in the user's
+cache folder (`~/.cache/pdfopt`) and not analysed again with the same settings.
+
+`-o` writes a result under a temporary name and renames it when it is complete;
+an existing output file is replaced only by a finished result. Ctrl+C and a
+termination request (`kill`, `docker stop`) stop the run with exit code 130,
+remove the work folders and leave the sources unchanged. `--dry-run` needs no
+write access to the folder of the file. Files that claim PDF/A-1 keep a
+structure that PDF/A-1 allows. When several files run at once, their number is bounded
 by free memory (about 700 MB per file with `-q`).

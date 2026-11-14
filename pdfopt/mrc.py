@@ -29,7 +29,7 @@ from pikepdf import Name
 from PIL import Image, ImageFilter, TiffImagePlugin
 
 from . import imagedata, jpegopt, lossless
-from .pdfmodel import MRC_FORM_KEY, filters_of, open_pdf, page_resources
+from .pdfmodel import MRC_FORM_KEY, filters_of, open_pdf, page_resources, pdfa_part
 from .progress import Callback, nothing
 from .render import SSIM_DPI, VisualGate
 from .ssim import ssim
@@ -65,6 +65,7 @@ PALETTE_LIGHTNESS = 0.35
 PALETTE_MERGE = 48.0
 PALETTE_FIT = 40.0
 PALETTE_SUPPORT = 20            # cells an ink needs to become a palette entry
+PALETTE_PROBE = 2000            # far cells sampled when a new ink is seeded
 MAX_INKS = 6
 # A page may use the lower MRC threshold only when the loss comes from
 # bilevel text edges: every inked tile of the ideal-background composite must
@@ -141,11 +142,10 @@ def ink_mask(gray: np.ndarray, dpi: float) -> np.ndarray:
     if np.median(small) < 110:
         gray = 255 - gray
         small = 255 - small
-    paper = Image.fromarray(small).filter(ImageFilter.MaxFilter(5))
-    paper = imagedata.box_blur(np.asarray(paper), 3)
-    paper = Image.fromarray(paper.clip(0, 255).astype(np.uint8)).resize(
-        (width, height), Image.Resampling.BILINEAR)
-    paper = np.asarray(paper, dtype=np.int16)
+    brightest = Image.fromarray(small).filter(ImageFilter.MaxFilter(5))
+    smooth = imagedata.box_blur(np.asarray(brightest), 3)
+    paper = np.asarray(Image.fromarray(smooth.clip(0, 255).astype(np.uint8)).resize(
+        (width, height), Image.Resampling.BILINEAR), dtype=np.int16)
     contrast = paper - gray.astype(np.int16)
     ink = contrast > np.maximum(30, (paper * 3) // 10)
     if dpi >= 250:
@@ -227,6 +227,12 @@ def background_image(bitmap: Image.Image, ink: Image.Image,
                            bitmap.mode)
 
 
+def _unit_rgb(values) -> tuple[float, float, float]:
+    """0..255 colour components as the 0..1 values of PDF operators."""
+    red, green, blue = (float(value) / 255 for value in values)
+    return red, green, blue
+
+
 def _ink_space(colours: np.ndarray) -> np.ndarray:
     """RGB -> (damped lightness, chroma), the space inks are told apart in."""
     lightness = colours.mean(axis=-1, keepdims=True)
@@ -260,19 +266,22 @@ def _palette(colours: np.ndarray, known: np.ndarray):
     """
     sample = colours[known]
     points = _ink_space(sample)
-    centres = [np.median(points, axis=0)]
-    while len(centres) < MAX_INKS:
-        nearest = np.sqrt(((points[:, None] - np.array(centres)[None]) ** 2)
+    seeds = [np.median(points, axis=0)]
+    while len(seeds) < MAX_INKS:
+        nearest = np.sqrt(((points[:, None] - np.array(seeds)[None]) ** 2)
                           .sum(axis=2)).min(axis=1)
         far = points[nearest > PALETTE_MERGE]
         if len(far) < PALETTE_SUPPORT:
             break
-        # Seed at the densest far colour, not at a stray outlier.
-        probe = far[:2000]
-        density = (((far[:, None] - probe[None]) ** 2).sum(axis=2)
+        # Seed at the densest far colour, not at a stray outlier. The seed is
+        # picked among a sample and its neighbours are counted in a sample:
+        # every pair of a two-ink page would take gigabytes.
+        step = max(1, len(far) // PALETTE_PROBE)
+        probe = far[::step][:PALETTE_PROBE]
+        density = (((probe[:, None] - probe[None]) ** 2).sum(axis=2)
                    < (PALETTE_MERGE / 2) ** 2).sum(axis=1)
-        centres.append(far[np.argmax(density)])
-    centres = np.array(centres)
+        seeds.append(probe[np.argmax(density)])
+    centres = np.array(seeds)
     for _ in range(8):
         label = ((points[:, None] - centres[None]) ** 2).sum(axis=2).argmin(axis=1)
         kept = [k for k in range(len(centres)) if (label == k).sum() >= PALETTE_SUPPORT]
@@ -306,7 +315,7 @@ def _palette_inks(rgb: np.ndarray, ink: np.ndarray, dpi: float) -> Foreground | 
                       for k in range(len(palette))])
     label = np.where(inked, votes.argmax(axis=0), 0)
     pixels = np.repeat(np.repeat(label, cell, 0), cell, 1)[:ink.shape[0], :ink.shape[1]]
-    inks = [(tuple(float(v) / 255 for v in palette[k]), ink & (pixels == k))
+    inks = [(_unit_rgb(palette[k]), ink & (pixels == k))
             for k in range(len(palette))]
     inks = [(color, stencil) for color, stencil in inks if stencil.any()]
     if len(inks) < 2:
@@ -330,7 +339,7 @@ def _foreground(rgb: np.ndarray, ink: np.ndarray, dpi: float) -> Foreground:
     cores = sample[brightness > 145] if np.median(brightness) > 128 \
         else sample[brightness < 110]
     cores = cores if len(cores) >= 50 else sample
-    color = tuple(float(v) / 255 for v in np.median(cores, axis=0))
+    color = _unit_rgb(np.median(cores, axis=0))
     if cores.std(axis=0).max() < 28:
         return Foreground([(color, ink)])
     found = _palette_inks(rgb, ink, dpi)
@@ -363,7 +372,8 @@ def _encode_stencil(packed: np.ndarray, width: int, height: int) -> tuple[bytes,
         bitmap.save(output, "TIFF", compression="group4", tiffinfo=tags)
         output.seek(0)
         with Image.open(output) as tiff:
-            offsets, counts = tiff.tag_v2[273], tiff.tag_v2[279]
+            tags_read = tiff.tag_v2  # type: ignore[attr-defined]
+            offsets, counts = tags_read[273], tags_read[279]
         if len(offsets) == len(counts) == 1:
             group4 = output.getvalue()[offsets[0]:offsets[0] + counts[0]]
             if len(group4) < len(flate):
@@ -471,7 +481,7 @@ def _best_jpeg(page: _Page, background: Image.Image):
 
 
 def _background_search(page: _Page, bitmap: Image.Image, dpi: float,
-                       scratch: Path):
+                       scratch: Path, jpx: bool = True):
     """Cheapest passing background -> (bytes, size, codec) or None.
 
     Starts at 100 dpi; a pass is followed by a try at 50 dpi, a failure by a
@@ -489,7 +499,7 @@ def _background_search(page: _Page, bitmap: Image.Image, dpi: float,
         if found is None:
             return None
         candidates = [(jpegopt.tighten(found[1]), "/DCTDecode")]
-        for rate in JPX_RATES:
+        for rate in JPX_RATES if jpx else ():
             data = _jpx(background, rate, scratch)
             if data is None:
                 break
@@ -515,8 +525,10 @@ def _background_search(page: _Page, bitmap: Image.Image, dpi: float,
 
 
 def find_layers(job: PageJob, minimum: float, scratch: Path,
-                relaxed: float | None = None) -> Layers | None:
+                relaxed: float | None = None, jpx: bool = True) -> Layers | None:
     """Segment one page and search the cheapest background that passes.
+
+    ``jpx`` allows a JPEG 2000 background (PDF/A-1 does not).
 
     ``relaxed`` is the lower SSIM allowed for text pages (see ``text_like``):
     bilevel ink cannot reproduce soft scanned edges, so such pages would
@@ -552,7 +564,7 @@ def find_layers(job: PageJob, minimum: float, scratch: Path,
     if relaxed is not None and relaxed < minimum and page.text_like():
         page.minimum = relaxed
 
-    best = _background_search(page, bitmap, dpi, scratch)
+    best = _background_search(page, bitmap, dpi, scratch, jpx)
     budget = job.stored - sum(len(item.mask) + 600 for item in inks)
     if best is None or len(best[0]) >= budget:
         return None
@@ -561,13 +573,13 @@ def find_layers(job: PageJob, minimum: float, scratch: Path,
 
 
 def _layer_job(args):
-    job, minimum, relaxed, scratch = args
+    job, minimum, relaxed, scratch, jpx = args
     if job is None:
         return None
     directory = scratch / f"mrc-{job.number}"
     directory.mkdir(exist_ok=True)
     try:
-        return find_layers(job, minimum, directory, relaxed)
+        return find_layers(job, minimum, directory, relaxed, jpx)
     except Exception:   # one odd page must not cost the other pages their layers
         return None
     finally:
@@ -616,10 +628,10 @@ def jbig2_streams(stencils: list[bytes], scratch: Path, *, symbols: bool = True,
             done = run([jbig2, "-s", "-p", "-t", str(threshold), "-b", str(base),
                         *map(str, paths)])
             table = directory / "out.sym"
-            pages = sorted(directory.glob("out.[0-9]*"))
-            if done.returncode != 0 or not table.is_file() or len(pages) != len(chunk):
+            files = sorted(directory.glob("out.[0-9]*"))
+            if done.returncode != 0 or not table.is_file() or len(files) != len(chunk):
                 return None
-            return table.read_bytes(), [page.read_bytes() for page in pages]
+            return table.read_bytes(), [file.read_bytes() for file in files]
         finally:
             shutil.rmtree(directory, ignore_errors=True)
 
@@ -731,7 +743,7 @@ def load_job(scan: Scan) -> PageJob | None:
 
 def _bounded_map(pool, function, items, window: int):
     """Like ``pool.map`` but never holds more than ``window`` jobs in memory."""
-    pending = []
+    pending: list = []
     iterator = iter(items)
     done = False
     while pending or not done:
@@ -754,10 +766,11 @@ def add_layers(pdf: pikepdf.Pdf, scratch: Path, minimum: float, jobs: int,
     if not candidates:
         return []
     results = []
+    jpx = pdfa_part(pdf) != 1       # PDF/A-1 has no JPEG 2000
     with ProcessPoolExecutor(max_workers=jobs) if jobs > 1 else _Inline() as pool:
         stream = _bounded_map(
             pool, _layer_job,
-            ((load_job(scan), minimum, relaxed, scratch) for scan in candidates),
+            ((load_job(scan), minimum, relaxed, scratch, jpx) for scan in candidates),
             jobs * 2)
         for index, (scan, layers) in enumerate(zip(candidates, stream), start=1):
             if layers is not None:
@@ -889,9 +902,11 @@ def build(source: Path, target: Path, scratch: Path, minimum: float, jobs: int,
         thresholds = sorted({r.minimum for r in records})
         for index, threshold in enumerate(thresholds):
             pages = [r.page for r in records if r.minimum == threshold]
-            failed.update(gate.failures(
-                target, pages, minimum=threshold,
-                progress=lambda f, i=index: progress(0.75 + 0.25 * (i + f) / len(thresholds))))
+
+            def checked(fraction: float, done: int = index) -> None:
+                progress(0.75 + 0.25 * (done + fraction) / len(thresholds))
+
+            failed.update(gate.failures(target, pages, minimum=threshold, progress=checked))
         passed = len(records) - len(failed)
         if not passed:
             lowest = min(r.minimum for r in records)

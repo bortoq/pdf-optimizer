@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdfopt"
-version = "0.2.0"
+dynamic = ["version"]            # pdfopt.__version__
 description = "PDF optimizer: lossless recompression, JPEG re-encoding and layered MRC for scans"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,7 +14,6 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES", "pdfopt/_ect/License.txt",
                  "pdfopt/_ect/zopfli/COPYING"]
 dependencies = [
     "pikepdf>=9,<11",
-    "pypdf>=5,<7",
     "Pillow>=10,<13",
     "numpy>=1.26,<3",
     "fonttools>=4.50,<5",                         # subsetting embedded TrueType fonts
@@ -33,7 +32,7 @@ Homepage = "https://github.com/bortoq/pdf-optimizer"
 Issues = "https://github.com/bortoq/pdf-optimizer/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.5"]
+dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
 
 [project.scripts]
 pdfopt = "pdfopt.cli:main"
@@ -43,6 +42,9 @@ pdfopt = "pdfopt.cli:main"
 # built module (the licenses go to dist-info via license-files).
 include-package-data = false
 
+[tool.setuptools.dynamic]
+version = {attr = "pdfopt.__version__"}
+
 [tool.setuptools.package-data]
 pdfopt = ["py.typed"]
 
@@ -51,7 +53,10 @@ include = ["pdfopt*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.mypy]
+files = ["pdfopt"]
+ignore_missing_imports = true    # fontTools and mozjpeg ship no type hints
 
 [tool.ruff]
 line-length = 100

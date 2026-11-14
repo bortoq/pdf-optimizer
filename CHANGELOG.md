@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+**Audit fixes (second round)**
+- A damaged file can no longer stop a run. A page tree whose `/Parent` links form
+  a loop made pdfopt hang for ever; a wrong object type in a page (`/Rotate` as a
+  string, `/Contents` as a dictionary...) ended the whole batch with a traceback.
+  Both are now an `error:` line for that file, and the other files are processed.
+- MRC ink palette: seeding a new ink compared every far cell with 2000 others,
+  which on a page of two inks in equal amounts (60 000 cells) took 4.6 GB and
+  11 s in each page process. The seed is now chosen within a sample of 2000:
+  0.4 s and 160 MB, same palette.
+- PDF/A-1 stays PDF/A-1: a file whose XMP claims part 1 keeps its PDF version and
+  gets no object or xref streams and no JPEG 2000 backgrounds (all three are
+  forbidden there); Ghostscript is not offered to PDF/A files of any part.
+- `--dry-run` works in a folder without write access (the work folder then goes
+  to the system's temporary folder).
+- The new file is flushed to the disk (`fsync`) before it replaces the source,
+  and the folder after: a power cut leaves the old file or the new one.
+- `SIGTERM` (`kill`, `docker stop`, `timeout`) ends a run like Ctrl+C: worker
+  processes are told, work folders are removed, sources stay unchanged, exit
+  code 130.
+- `-o`: the result is written under a temporary name and renamed when complete.
+  An output file that existed before a failed or interrupted run is left as it
+  was (it used to be overwritten and then deleted).
+- `-r` does not descend into work folders (`.pdfopt-*`) left by a killed run.
+- A candidate from an engine that rewrites the whole file (Ghostscript, Hyper
+  Compress) is rejected when the document lost its outlines, page labels,
+  language, viewer preferences, output intents, structure tree, layers, page
+  mode/layout or open action. After Ghostscript the language, viewer
+  preferences, page mode/layout and the Info entries of the source are put back
+  (it dropped the first ones and wrote its own Producer and dates).
+
+**Interface**
+- Files that gained nothing are remembered (`~/.cache/pdfopt/no-gain.json`, or
+  `$XDG_CACHE_HOME`, `%LOCALAPPDATA%` on Windows) by content and settings, so the
+  next run over a library does not analyse them again; `-v` shows `no change
+  (known from an earlier run)`. `--force`, another `-q`, a new pdfopt version or
+  a newly installed program make them be analysed again.
+- The marker records the `-q` a lossy file was made with. A lower `-q` processes
+  the file again; the same or a higher one still answers "already optimized"
+  (as do files marked before this change).
+
+**Dependencies and build**
+- `pypdf` is no longer needed: the text of Ghostscript/Hyper candidates is
+  compared with poppler's `pdftotext`, which comes with `pdftoppm`.
+- The version is defined once (`pdfopt.__version__`).
+- CI: Python 3.11–3.14 on Linux, a weekly run against new releases of the
+  dependencies, `mypy` (the package is typed, `py.typed`), deprecation warnings
+  are shown again. A failed build of the ECT module fails CI and the release
+  (`PDFOPT_REQUIRE_ECT=1`) instead of silently giving a wheel without it.
+- Release: the tests run before publishing; wheels also for Python 3.14, Linux
+  aarch64 and Intel macOS; every wheel is checked to contain a working ECT
+  module.
+
 **Interface**
 - The progress bar moves while a file is being processed (layering of scan
   pages, rendering checks, ECT), not only when a file is finished. It shows the

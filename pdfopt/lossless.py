@@ -29,12 +29,12 @@ from pikepdf import Name
 from PIL import Image
 
 from . import fonts, imagedata
-from .pdfmodel import collect_images, filters_of, iter_streams, open_pdf
+from .pdfmodel import collect_images, filters_of, iter_streams, open_pdf, pdfa_part
 from .progress import Callback, nothing
 from .tools import ToolError, run, which
 
 try:   # the bundled ECT compressor (build: python setup.py build_ext --inplace)
-    from . import _ectdeflate
+    from . import _ectdeflate  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - depends on the environment
     _ectdeflate = None
 
@@ -93,6 +93,7 @@ def merge_identical_streams(pdf: pikepdf.Pdf) -> int:
         return 0
 
     def fix(container) -> None:
+        pairs: list
         if isinstance(container, pikepdf.Array):
             pairs = list(enumerate(container))
         elif isinstance(container, (pikepdf.Dictionary, pikepdf.Stream)):
@@ -256,7 +257,7 @@ def _predicted(rows: np.ndarray, bits: int, ncomp: int, width: int):
 def rewrite(item: ImageInput, scratch: Path, jbig2_ok: bool) -> Replacement | None:
     """Pick the smallest equivalent encoding of one image (thread-safe)."""
     try:
-        if item.kind == "jpeg":
+        if item.kind == "jpeg" and item.jpeg is not None:
             encoded = optimize_jpeg(item.jpeg)
             if encoded is None:
                 return None
@@ -269,6 +270,8 @@ def rewrite(item: ImageInput, scratch: Path, jbig2_ok: bool) -> Replacement | No
 def _rewrite_raw(item: ImageInput, scratch: Path, jbig2_ok: bool) -> Replacement | None:
     rows, bits, ncomp, width, height = (item.rows, item.bits, item.ncomp,
                                         item.width, item.height)
+    if rows is None:
+        return None
     updates: dict = {}
     notes: list[str] = []
     family = item.family
@@ -429,14 +432,21 @@ def ect_streams(pdf: pikepdf.Pdf, jobs: int, progress: Callback = nothing) -> bo
         if old is not None and len(new) >= old:
             continue
         stream.write(new, filter=Name.FlateDecode,
-                     decode_parms=stream.get("/DecodeParms"))
+                     decode_parms=stream.get("/DecodeParms"))  # type: ignore[arg-type]
     return True
 
 
 # ------------------------------------------------------------------- build --
 
 def save(pdf: pikepdf.Pdf, target: Path, *, deflated: bool) -> None:
-    pdf.save(target, object_stream_mode=pikepdf.ObjectStreamMode.generate,
+    """Write ``pdf`` with object and xref streams.
+
+    PDF/A-1 is PDF 1.4 and forbids both, so a file that claims it keeps its
+    classic structure (and its version) and stays valid.
+    """
+    mode = (pikepdf.ObjectStreamMode.preserve if pdfa_part(pdf) == 1
+            else pikepdf.ObjectStreamMode.generate)
+    pdf.save(target, object_stream_mode=mode,
              compress_streams=True, recompress_flate=not deflated,
              fix_metadata_version=False, deterministic_id=True)
 

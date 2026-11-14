@@ -231,8 +231,9 @@ class Change:
 
 def revert(change: Change) -> None:
     obj = change.obj
-    for key in [k for k in obj if k != "/Length"]:
-        del obj[key]
+    for key in sorted(obj.keys()):
+        if key != "/Length":
+            del obj[key]
     for key, value in change.entries.items():
         if key not in ("/Length", "/Filter", "/DecodeParms"):
             obj[key] = value
@@ -280,6 +281,8 @@ def _extract(obj, dpi: float | None) -> Job | None:
     try:
         width, height = int(obj.Width), int(obj.Height)
         ncomp = imagedata.components(obj.get("/ColorSpace"))
+        if ncomp is None:
+            return None
         stored = len(obj.read_raw_bytes())
         filters = filters_of(obj)
         if filters in (["/DCTDecode"], ["/FlateDecode", "/DCTDecode"]):
@@ -337,7 +340,7 @@ def optimize_jpegs(pdf: pikepdf.Pdf, scratch: Path, minimum: float,
                 if result is None:
                     continue
                 data, (width, height) = result
-                changes.append(Change(obj, pages, {k: obj[k] for k in obj},
+                changes.append(Change(obj, pages, dict(obj.items()),
                                       bytes(obj.read_raw_bytes())))
                 obj.write(data, filter=Name.DCTDecode, decode_parms=None)
                 obj.Width, obj.Height = width, height

@@ -27,11 +27,13 @@ def require(name: str) -> str:
 
 
 def run(args: list[str], *, timeout: float = TIMEOUT,
-        stdout_to: Path | None = None) -> subprocess.CompletedProcess:
+        stdout_to: Path | None = None, binary: bool = False) -> subprocess.CompletedProcess:
     """Run a tool without a shell; never inherits stdin.
 
     With ``stdout_to`` the standard output is written to that file in binary
-    mode (used by encoders that only write to stdout).
+    mode (used by encoders that only write to stdout). With ``binary`` the
+    captured output is bytes. Text output that is not valid in the locale's
+    encoding is kept with replacement characters instead of failing.
     """
     try:
         if stdout_to is not None:
@@ -40,7 +42,8 @@ def run(args: list[str], *, timeout: float = TIMEOUT,
                                       stderr=subprocess.PIPE, check=False,
                                       timeout=timeout,
                                       stdin=subprocess.DEVNULL)
-        return subprocess.run(args, capture_output=True, text=True,
+        return subprocess.run(args, capture_output=True, text=not binary,
+                              errors=None if binary else "replace",
                               check=False, timeout=timeout,
                               stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:

@@ -22,6 +22,7 @@ from .pdfmodel import (
     Skipped,
     compare,
     has_signature,
+    marker_quality,
     open_pdf,
     read_marker,
     set_marker,
@@ -106,6 +107,43 @@ def _make_ghostscript(source: Path, target: Path, dpi: int, qfactor: float) -> N
         "-f", str(source)])
     if done.returncode != 0 or not target.is_file():
         raise ToolError("Ghostscript: " + last_line(done))
+    _keep_document_settings(source, target)
+
+
+# Catalog entries Ghostscript drops that are plain values (no links to pages),
+# so they can be carried over as they are.
+_PLAIN_CATALOG_KEYS = ("/Lang", "/ViewerPreferences", "/PageLayout", "/PageMode")
+
+
+def _keep_document_settings(source: Path, target: Path) -> None:
+    """Copy the plain catalog settings and the Info entries of ``source`` into
+    a rewritten ``target`` (Ghostscript writes its own Producer and dates)."""
+    with open_pdf(source) as original, pikepdf.open(target) as pdf:
+        def carry(value):
+            # Only indirect objects can cross from one file to another.
+            if not value.is_indirect:
+                value = original.make_indirect(value)
+            return pdf.copy_foreign(value)
+
+        changed = False
+        for key in _PLAIN_CATALOG_KEYS:
+            if key in original.Root and key not in pdf.Root:
+                pdf.Root[key] = carry(original.Root[key])
+                changed = True
+        before = {str(k): str(v) for k, v in pdf.docinfo.items()}
+        wanted = {str(k): v for k, v in original.docinfo.items()}
+        if before != {k: str(v) for k, v in wanted.items()}:
+            for key in list(pdf.docinfo.keys()):
+                del pdf.docinfo[key]
+            for key, value in wanted.items():
+                pdf.docinfo[key] = carry(value)
+            changed = True
+        if not changed:
+            return
+        kept = target.with_name("kept.pdf")
+        pdf.save(kept, object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                 compress_streams=True, fix_metadata_version=False)
+    os.replace(kept, target)
 
 
 # ----------------------------------------------------------- orchestration --
@@ -294,8 +332,11 @@ class _Run:
                                   metadata=not lossy)]
 
             tasks.append(Task("Hyper Compress", hyper))
+        # Ghostscript rewrites the whole file: not for forms, text, or PDF/A
+        # (its output would no longer conform).
         if (self.mode == "lossy" and not self.baseline.interactive and
-                not self.baseline.has_text_layer and which("gs")):
+                not self.baseline.has_text_layer and self.baseline.pdfa is None
+                and which("gs")):
             for dpi, qfactor in GHOSTSCRIPT_PROFILES:
                 def ghostscript(dpi=dpi, qfactor=qfactor) -> list[Candidate]:
                     target = self.directory("gs") / "out.pdf"
@@ -323,13 +364,36 @@ def _pick(run_: _Run, candidates: list[Candidate],
     return None
 
 
-def _stamp(candidate: Candidate, lossy: bool, scratch: Path) -> Path:
+def _stamp(candidate: Candidate, lossy: bool, quality: int | None, target: Path) -> Path:
     """Write the optimizer marker into the winner (a cheap lossless re-save)."""
-    target = scratch / "stamped.pdf"
     with open_pdf(candidate.path) as pdf:
-        set_marker(pdf, lossy)
+        set_marker(pdf, lossy, quality)
         lossless.save(pdf, target, deflated=True)
     return target
+
+
+def _flush(path: Path) -> None:
+    """Force a file (or, where the system allows, a folder) to the disk."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    try:
+        handle = os.open(path, flags)
+    except OSError:
+        return                      # folders cannot be opened on Windows
+    try:
+        os.fsync(handle)
+    except OSError:
+        pass
+    finally:
+        os.close(handle)
+
+
+def _scratch_parent(path: Path, dry_run: bool) -> Path | None:
+    """Where the work folder goes: next to the file, which the atomic replace
+    needs (same file system). A dry run replaces nothing, so it falls back to
+    the system's temporary folder when the file's folder is read-only."""
+    if dry_run and not os.access(path.parent, os.W_OK | os.X_OK):
+        return None
+    return path.parent
 
 
 def _timed(log: Log | None) -> Log:
@@ -359,13 +423,16 @@ def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
     The result unpacks as ``(status, saved)``; its ``scores`` hold the SSIM of
     each page of a new lossy file.
     """
-    options = {"dry_run": dry_run, "min_ssim": min_ssim, "jobs": jobs, "force": force,
-               "safe_text": safe_text, "mrc_ssim": mrc_ssim, "log": log,
-               "progress": Span(progress)}
+    def optimize(work: Path) -> Outcome:
+        return _optimize(path, work, mode, dry_run=dry_run, min_ssim=min_ssim, jobs=jobs,
+                         force=force, safe_text=safe_text, mrc_ssim=mrc_ssim, log=log,
+                         progress=Span(progress))
+
     if not decrypt:
-        return _optimize(path, path, mode, **options)
-    with tempfile.TemporaryDirectory(prefix=".pdfopt-open-", dir=path.parent) as keep:
-        return _optimize(path, _decrypted(path, Path(keep)), mode, **options)
+        return optimize(path)
+    with tempfile.TemporaryDirectory(prefix=".pdfopt-open-",
+                                     dir=_scratch_parent(path, dry_run)) as keep:
+        return optimize(_decrypted(path, Path(keep)))
 
 
 def _decrypted(path: Path, directory: Path) -> Path:
@@ -398,9 +465,15 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
         if has_signature(pdf):
             raise Skipped("the document has a digital signature and is left unchanged")
         marker = read_marker(pdf)
+        earlier = marker_quality(pdf)
         baseline = Fingerprint.read(pdf, work)
     lossy = mode == "lossy"
-    if not force and marker and marker[0] >= MARKER_VERSION and (marker[1] or not lossy):
+    quality = round(min_ssim * 100) if lossy else None
+    # A lossy file is taken again only for a lower -q than it was made with
+    # (files marked before the quality was recorded are left alone).
+    lower = lossy and earlier is not None and quality is not None and quality < earlier
+    if (not force and marker and marker[0] >= MARKER_VERSION
+            and (marker[1] or not lossy) and not lower):
         return Outcome(ALREADY, 0)
     worker = find_worker()
     if lossy and which("pdftoppm") is None:
@@ -408,7 +481,8 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
     if worker is not None and which("pdftoppm") is None:
         raise ValueError("PDF: pdftoppm is needed to check Hyper Compress")
 
-    with tempfile.TemporaryDirectory(prefix=".pdfopt-", dir=path.parent) as directory:
+    with tempfile.TemporaryDirectory(prefix=".pdfopt-",
+                                     dir=_scratch_parent(path, dry_run)) as directory:
         scratch = Path(directory)
         state = _Run(work, mode, min_ssim, jobs, scratch, baseline, log, safe_text,
                      mrc_ssim, progress)
@@ -449,17 +523,17 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
             if not candidates and state.errors:
                 raise ValueError("PDF: " + "; ".join(state.errors))
             return Outcome("no change", 0)
-        final = _stamp(best, lossy, scratch)
+        final = _stamp(best, lossy, quality, scratch / "stamped.pdf")
         size = final.stat().st_size
         if size >= source_stat.st_size:
             return Outcome("no change", 0)
         saving = source_stat.st_size - size
-        scores = ()
+        scores: tuple[float, ...] = ()
         if lossy:
             # The pages of the file as it will be written, against the source.
             pages = list(range(1, len(baseline.pages) + 1))
-            scores = state.visual_gate().scores(
-                final, pages, progress=progress.part(0.85, 0.98)).values()
+            scores = tuple(state.visual_gate().scores(
+                final, pages, progress=progress.part(0.85, 0.98)).values())
         if dry_run:
             return Outcome(f"possible saving ({best.name})", saving, scores)
         current = path.stat()
@@ -473,6 +547,10 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
             # Only root can do this; anyone else only replaces their own files.
             with contextlib.suppress(PermissionError):
                 os.chown(final, current.st_uid, current.st_gid)
+        # On the disk before the name changes hands, and the rename itself
+        # after: a power cut leaves either the old file or the new one.
+        _flush(final)
         os.replace(final, path)
+        _flush(path.parent)
         progress(1.0)
         return Outcome(f"compressed ({best.name})", saving, scores)
