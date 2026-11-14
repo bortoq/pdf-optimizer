@@ -543,7 +543,7 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
             raise ValueError("the source file changed during processing")
         shutil.copystat(path, final)   # mode, times and extended attributes
         if hasattr(os, "chown") and (current.st_uid, current.st_gid) != (
-                os.getuid(), os.getgid()):
+                os.getuid(), os.getgid()):  # type: ignore[attr-defined]
             # Only root can do this; anyone else only replaces their own files.
             with contextlib.suppress(PermissionError):
                 os.chown(final, current.st_uid, current.st_gid)

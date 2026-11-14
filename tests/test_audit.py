@@ -244,8 +244,10 @@ class DurabilityTests(unittest.TestCase):
 @unittest.skipIf(sys.platform == "win32", "POSIX signals")
 @unittest.skipUnless(need("pdftoppm"), "pdftoppm is not installed")
 class TerminationTests(unittest.TestCase):
-    def terminate(self, *options) -> tuple[int, str, list[str]]:
+    def terminate(self, *options, output: bool = False) -> tuple[int, str, list[str]]:
         with tempfile.TemporaryDirectory() as root:
+            if output:
+                options += ("-o", str(Path(root) / "out"))
             books = Path(root) / "books"
             books.mkdir()
             for index in range(3):
@@ -255,7 +257,13 @@ class TerminationTests(unittest.TestCase):
                 [sys.executable, "-m", "pdfopt", "-q", "90", *options, str(books)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                 cwd=Path(__file__).parent.parent)
-            time.sleep(2.5)
+            # Stop it in the middle of a file: as soon as a work folder is there.
+            deadline = time.monotonic() + 60
+            while not any(p.name.startswith(".pdfopt-") for p in Path(root).rglob(".pdfopt-*")):
+                if process.poll() is not None or time.monotonic() > deadline:
+                    process.kill()
+                    self.fail("the run made no work folder")
+                time.sleep(0.02)
             process.send_signal(signal.SIGTERM)
             try:
                 _, err = process.communicate(timeout=60)
@@ -264,6 +272,7 @@ class TerminationTests(unittest.TestCase):
                 self.fail("the run did not stop after SIGTERM")
             left = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*")
                           if p.name.startswith(".pdfopt-"))
+            # Not one file was finished, so every source is as it was.
             self.assertEqual({book.name: book.stat().st_size for book in books.iterdir()
                               if not book.name.startswith(".")}, sizes)
             return process.returncode, err, left
@@ -274,7 +283,7 @@ class TerminationTests(unittest.TestCase):
         self.assertIn("interrupted", err)
 
     def test_worker_processes_are_told_and_clean_up(self):
-        code, err, left = self.terminate("-j", "3", "-o", "out")
+        code, err, left = self.terminate("-j", "3", output=True)
         self.assertEqual((code, left), (130, []))
         self.assertIn("interrupted", err)
 

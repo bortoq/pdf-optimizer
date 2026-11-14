@@ -185,7 +185,7 @@ def size_classes(ink: np.ndarray) -> list[tuple[float, np.ndarray]]:
     """
     rows = ink.any(axis=1)
     edges = np.diff(np.concatenate(([0], rows.astype(np.int8), [0])))
-    band = np.zeros(len(rows))
+    band = np.zeros(ink.shape[0])
     for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
         band[start:stop] = symbol_threshold(stem_height(ink[start:stop]))
     return [(threshold, ink & (band == threshold)[:, None])

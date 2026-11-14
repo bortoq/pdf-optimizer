@@ -375,9 +375,11 @@ class BuildTests(unittest.TestCase):
                 target = scratch / "mrc.pdf"
                 gate = VisualGate(source, scratch, 0.96, 2)
                 # Small test glyphs would be coded losslessly: force symbol mode.
+                # One job keeps the layering in this process: page processes
+                # started by a fork server would not see the patched values.
                 with patch.object(mrc, "JBIG2_CHUNK", 2), \
                         patch.object(mrc, "JBIG2_THRESHOLDS", ((0, 0.90),)):
-                    mrc.build(source, target, scratch, 0.96, 2, gate, symbols=symbols)
+                    mrc.build(source, target, scratch, 0.96, 1, gate, symbols=symbols)
                 self.assertEqual(gate.failures(target, [1, 2, 3]), [])
                 with open_pdf(target) as pdf:
                     ink = pdf.pages[0].Resources.XObject.Im0.Resources.XObject.Ink0

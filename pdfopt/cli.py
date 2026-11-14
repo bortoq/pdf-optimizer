@@ -120,7 +120,9 @@ def _available_mb() -> int | None:
     except (OSError, ValueError, IndexError):
         pass
     try:
-        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (2 * 1024 ** 2)
+        pages = os.sysconf("SC_PHYS_PAGES")  # type: ignore[attr-defined]
+        size = os.sysconf("SC_PAGE_SIZE")  # type: ignore[attr-defined]
+        return pages * size // (2 * 1024 ** 2)
     except (ValueError, OSError, AttributeError):
         return None
 
