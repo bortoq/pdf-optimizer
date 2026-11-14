@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 import contextlib
 import multiprocessing
 import os
@@ -149,11 +150,21 @@ class _Interrupted(BaseException):
     """Ctrl+C or a termination request; unwinds quietly (temporary files are removed)."""
 
 
+_BUSY = False        # a worker process is inside _process
+_STOPPING = False    # ... and is cleaning up after a signal
+_AGAIN = False       # ... and was told to stop once more meanwhile
+
+
 def _stop(signum, frame) -> None:
-    # Once is enough: a second signal must not break the clean-up.
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    raise _Interrupted
+    """Ctrl+C or a termination request in a worker process."""
+    global _STOPPING, _AGAIN
+    if _STOPPING:
+        _AGAIN = True       # must not break the clean-up; obeyed right after it
+    elif not _BUSY:
+        os._exit(130)       # between files: nothing to clean up, nobody to answer
+    else:
+        _STOPPING = True
+        raise _Interrupted
 
 
 _TERMINATED = False
@@ -201,7 +212,9 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | N
             last[0] = fraction
             emit(str(path), fraction)
 
+    global _BUSY, _STOPPING
     work = path
+    _BUSY = True
 
     def deliver() -> None:
         """Give the finished copy its name (replaces an older output file)."""
@@ -242,6 +255,9 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | N
         return str(path), "ok", saved, status, quality, key if status == NO_GAIN else None
     except (KeyboardInterrupt, _Interrupted):
         discard()
+        if _AGAIN:
+            # The pool is being torn down and waits for this process to end.
+            os._exit(130)
         return str(path), "interrupted", 0, "interrupted", None, None
     except Skipped as exc:
         try:
@@ -255,6 +271,8 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | N
         text = str(exc) if isinstance(exc, (OSError, ValueError)) else \
             f"unexpected {type(exc).__name__}: {exc}"
         return str(path), "failed", 0, f"error: {text}", None, None
+    finally:
+        _BUSY = _STOPPING = False
 
 
 def _size(path: Path) -> int:
@@ -457,18 +475,26 @@ def main(argv: list[str] | None = None) -> int:
                             with contextlib.suppress(OSError, ValueError):
                                 worker.terminate()
                     # Workers were stopped by the same Ctrl+C; collect them.
+                    # One that was stopped before it could answer has no result.
                     for future in wait(running)[0]:
                         if not future.cancelled():
-                            report(future.result())
+                            with contextlib.suppress(Exception):
+                                report(future.result())
                     raise
         else:
             for task in tasks:
                 report(_process(task, progress))
                 if interrupted:
                     raise KeyboardInterrupt
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, BrokenProcessPool) as stopped:
         if bar:
             bar.clear()
+        if isinstance(stopped, BrokenProcessPool) and not _TERMINATED:
+            # Killed from outside, most often by the system when memory ran out.
+            print(f"pdfopt: a worker process died, {done} of {len(paths)} files "
+                  "finished; the others are unchanged (try fewer cores with -j)",
+                  file=sys.stderr)
+            return 1
         print(f"pdfopt: interrupted, {done} of {len(paths)} files "
               "finished; the others are unchanged", file=sys.stderr)
         return 130
