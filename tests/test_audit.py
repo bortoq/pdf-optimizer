@@ -242,7 +242,10 @@ class DurabilityTests(unittest.TestCase):
                     patch("pdfopt.optimize.os.replace", replace):
                 self.assertIn("compressed", optimize_pdf(book, jobs=2)[0])
         at = events.index("replace source")
-        self.assertEqual(events[at - 1:at + 2], ["fsync", "replace source", "fsync"])
+        # The folder is flushed after the rename too, where folders can be
+        # opened (not on Windows).
+        expected = ["fsync", "replace source"] + (["fsync"] if sys.platform != "win32" else [])
+        self.assertEqual(events[at - 1:at + len(expected) - 1], expected)
 
 
 @unittest.skipIf(sys.platform == "win32", "POSIX signals")
