@@ -24,7 +24,37 @@ Same scans, byte-exact pixels (SSIM 1.000):
 | grayscale | 14,939 KB | 14,938 KB | **13,049 KB** | 1.4 s |
 | colour | 12,916 KB | 12,914 KB | **11,359 KB** | 1.9 s |
 
-Other documents (KB, source → pdfopt; `pikepdf`/qpdf in brackets):
+## Books and papers
+
+A set of 35 born-digital PDFs (135.9 MB: programming books, papers from
+pdfTeX and dvips, office documents, one signed form), lossless, before and
+after Type 1→CFF repacking, palettes and ECT for object streams:
+
+| | Saved |
+| --- | ---: |
+| before | 34.2 MB (25.2 %) |
+| after | **36.7 MB (27.0 %)** |
+
+Papers with Type 1 fonts gain the most (per file, before → after): −6.8 →
+**−72.2 %**, −2.6 → **−57.7 %**, −2.7 → **−56.7 %**, −23.7 → **−42.7 %**, a
+487-page book −34.5 → **−44.3 %**. Object streams packed with ECT give
+0.2–3 % on large books. All pages of the repacked fonts rendered pixel for
+pixel as before (poppler at 100 dpi, checked on every file; Ghostscript at 100
+and 300 dpi on samples).
+
+Lossy (`-q 90`), files with screenshots, diagrams and gray pictures stored
+as Flate; lowest page SSIM unchanged:
+
+| File | Before | After |
+| --- | ---: | ---: |
+| 448 pages, mostly gray Flate images (28.9 MB) | −22.6 % | **−51.7 %** |
+| 528 pages, gray Flate images (12.8 MB) | −18.1 % | **−29.3 %** |
+| 928 pages, gray Flate images (11.9 MB) | −38.1 % | **−47.0 %** |
+| 133 pages, flat RGB images (6.0 MB) | −50.4 % | **−86.9 %** |
+| 5 pages, flat RGB images (1.9 MB) | −43.2 % | **−79.9 %** |
+
+Other documents, measured with 0.2.0 (KB, source → pdfopt; `pikepdf`/qpdf in
+brackets):
 
 | Document | Result |
 | --- | --- |

@@ -6,18 +6,22 @@ One parse, several passes, one save:
 
 1. drops page thumbnails, merges identical streams;
 2. images: RGB with R=G=B becomes DeviceGray, pure black-and-white 8-bit images
-   become 1-bit, Flate images get the best PNG predictor, 1-bit Flate and CCITT
-   Group 4 are rewritten as **JBIG2 generic** (lossless);
+   become 1-bit, pictures of few colours (up to 256 for RGB, 16 for gray) become
+   indices into a colour table, Flate images get the best PNG predictor, 1-bit
+   Flate and CCITT Group 4 are rewritten as **JBIG2 generic** (lossless);
 3. JPEG: mozjpeg's `jpegtran` (optimized Huffman tables, tuned progressive
    scans) with a pixel-identity check, 0.7–28 % smaller than libjpeg's;
-4. embedded TrueType fonts are cut to the glyphs the document shows (fontTools,
-   glyph ids kept, content streams unchanged); the cmap tables are rebuilt, so
-   fonts without `/Encoding` (LibreOffice) work too. Pages with changed fonts
-   are compared pixel for pixel; with an AcroForm or any unclear font use the
-   font is left alone, and if a cut ever changes the rendering only the font
-   step is dropped, not the image steps;
+4. fonts: embedded TrueType fonts are cut to the glyphs the document shows
+   (fontTools, glyph ids kept, content streams unchanged; the cmap tables are
+   rebuilt, so fonts without `/Encoding` (LibreOffice) work too). **Type 1
+   fonts** (pdfTeX, dvips) are repacked as CFF with the same outlines, widths,
+   hints and encoding: their glyphs are stored encrypted, which Flate cannot
+   compress, so a paper typically shrinks by half. Pages with changed fonts are
+   compared pixel for pixel; with form fields nothing is cut, and if a font
+   changes the rendering only the fonts of the failing pages are left alone,
+   then all fonts, never the image steps first;
 5. streams are recompressed by the bundled ECT (like `ect -9`; streams above
-   4 MB like `ect -6`) and saved as object/xref streams.
+   4 MB like `ect -6`) and saved as object/xref streams, which ECT packs too.
 
 Metadata, text layer, geometry and annotations do not change.
 
@@ -31,7 +35,11 @@ On top of the lossless result:
   The JBIG2 symbol threshold depends on letter size, and very small text is
   coded losslessly, so 6 and 8 are never merged the way Xerox scanners did in 2013.
 - **JPEG** for other photos: the smallest JPEG (and dpi, from the content-stream
-  geometry) that passes SSIM; Flate photos become JPEG.
+  geometry) that passes SSIM; Flate photos become JPEG, gray ones too (a gray
+  photo is told from a gray screenshot by its texture).
+- **Palettes** for screenshots and diagrams stored as Flate: the fewest colours
+  (256, 64, 16 or 4) that pass SSIM, as indices into a colour table; JPEG would
+  ring around their sharp edges.
 - **Ghostscript** profiles (300/240/200 dpi) for PDFs without text or forms.
 - **Hyper Compress**, an external `hpdf-worker`, if found in `PATH`.
 

@@ -142,26 +142,33 @@ class VisualGate:
             shutil.rmtree(self.dir / "score", ignore_errors=True)
 
 
-def identical_pages(first: Path, second: Path, pages: list[int], scratch: Path,
-                    jobs: int = 1, progress: Callback = nothing) -> bool:
-    """True when the listed 1-based pages render pixel-for-pixel the same."""
+def changed_pages(first: Path, second: Path, pages: list[int], scratch: Path,
+                  jobs: int = 1, progress: Callback = nothing) -> list[int]:
+    """The listed 1-based pages that do not render pixel-for-pixel the same."""
     base = scratch / "exact"
     runs = _runs(pages, jobs)
     tick = Span(progress).counter(len(runs))
 
-    def work(run_pages: list[int]) -> bool:
+    def work(run_pages: list[int]) -> list[int]:
         a = render(first, run_pages[0], run_pages[-1], base / "a",
                    f"a{run_pages[0]}", dpi=EXACT_DPI)
         b = render(second, run_pages[0], run_pages[-1], base / "b",
                    f"b{run_pages[0]}", dpi=EXACT_DPI)
-        same = all(np.array_equal(_load(x), _load(y)) for x, y in zip(a, b))
+        changed = [page for page, x, y in zip(run_pages, a, b)
+                   if not np.array_equal(_load(x), _load(y))]
         for file in (*a, *b):
             file.unlink(missing_ok=True)
         tick()
-        return same
+        return changed
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-            return all(pool.map(work, runs))
+            return sorted(page for found in pool.map(work, runs) for page in found)
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+def identical_pages(first: Path, second: Path, pages: list[int], scratch: Path,
+                    jobs: int = 1, progress: Callback = nothing) -> bool:
+    """True when the listed 1-based pages render pixel-for-pixel the same."""
+    return not changed_pages(first, second, pages, scratch, jobs, progress)

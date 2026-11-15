@@ -193,3 +193,51 @@ def bitmap_from(jpeg: bytes | None, rows: np.ndarray | None, width: int,
         return Image.fromarray(rows.reshape(shape), "L" if ncomp == 1 else "RGB")
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
         return None
+
+
+# ---------------------------------------------------------------- palettes --
+
+def pack_indices(indices: np.ndarray, bits: int) -> np.ndarray:
+    """(height, width) indices -> rows of ``bits``-bit samples, as PDF stores them."""
+    if bits == 8:
+        return np.ascontiguousarray(indices, dtype=np.uint8)
+    per = 8 // bits
+    height, width = indices.shape
+    padded = np.zeros((height, -(-width // per) * per), dtype=np.uint8)
+    padded[:, :width] = indices
+    packed = np.zeros((height, padded.shape[1] // per), dtype=np.uint8)
+    for position in range(per):
+        packed |= (padded[:, position::per] << (8 - bits * (position + 1))).astype(np.uint8)
+    return packed
+
+
+def index_bits(count: int) -> int:
+    return 1 if count <= 2 else 2 if count <= 4 else 4 if count <= 16 else 8
+
+
+def exact_palette(pixels: np.ndarray, limit: int = 256):
+    """(indices, table) when an image (height, width, components) has at most
+    ``limit`` different colours, else None. Nothing is lost."""
+    height, width, components = pixels.shape
+    # A thinned sample settles most images without sorting every pixel.
+    probe = pixels[::max(1, height // 64), ::max(1, width // 64)].reshape(-1, components)
+    if len(np.unique(probe, axis=0)) > limit:
+        return None
+    key = np.zeros((height, width), dtype=np.uint32)
+    for channel in range(components):
+        key = key << 8 | pixels[:, :, channel]
+    values, inverse = np.unique(key, return_inverse=True)
+    if len(values) > limit:
+        return None
+    table = np.stack([(values >> (8 * (components - 1 - channel))) & 255
+                      for channel in range(components)], axis=1).astype(np.uint8)
+    return inverse.reshape(height, width).astype(np.uint8), table
+
+
+def write_indexed(obj, data: bytes, parms: dict | None, bits: int, table: bytes,
+                  count: int) -> None:
+    base = obj.get("/ColorSpace")
+    obj.write(data, filter=pikepdf.Name.FlateDecode,
+              decode_parms=pikepdf.Dictionary(**parms) if parms else None)
+    obj.ColorSpace = pikepdf.Array([pikepdf.Name.Indexed, base, count - 1, pikepdf.String(table)])
+    obj.BitsPerComponent = bits

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from functools import cache
 from io import BytesIO
 from pathlib import Path
+import zlib
 
 import mozjpeg_lossless_optimization
 import numpy as np
@@ -21,7 +22,7 @@ import pikepdf
 from pikepdf import Name
 from PIL import Image
 
-from . import imagedata
+from . import imagedata, lossless
 from .pdfmodel import collect_images, filters_of, page_resources
 from .progress import Callback, nothing
 from .render import SSIM_DPI
@@ -36,6 +37,7 @@ MIN_SIDE = 96
 BLIND_VIEW = 2000               # longest view side when the DPI is unknown
 MAX_UPSCALE = 4.0
 MAX_VIEW_PIXELS = 16_000_000
+PALETTE_SIZES = (256, 64, 16, 4)   # colours tried for graphics, most first
 
 
 # ---------------------------------------------------------------- geometry --
@@ -217,6 +219,96 @@ def reencode(bitmap: Image.Image, stored: int, dpi: float | None,
     return data, best[1]
 
 
+# ---------------------------------------------------------------- palettes --
+
+@dataclass
+class Palette:
+    """An image coded as indices into a colour table (an Indexed colour space)."""
+
+    data: bytes                     # Flate stream of the packed indices
+    parms: dict | None              # PNG predictor parameters, if used
+    bits: int                       # bits per index: 1, 2, 4 or 8
+    table: bytes                    # the colours, ``components`` bytes each
+    count: int
+
+
+def flate_rows(rows: np.ndarray, bits: int, width: int, *,
+               final: bool) -> tuple[bytes, dict | None]:
+    """The smaller of plain and PNG-predicted Flate for one-component rows.
+
+    ``final`` packs the winner with ECT when it is built (the stream is not
+    recompressed later); otherwise zlib gives the size estimate.
+    """
+    plain = rows.tobytes()
+    predicted = imagedata.png_predict(rows, 1)
+    use_predictor = len(zlib.compress(predicted, 6)) < len(zlib.compress(plain, 6))
+    raw = predicted if use_predictor else plain
+    if final and lossless.ect_available():
+        data = lossless.deflate_zlib(raw, lossless.ect_mode(len(raw)))
+    else:
+        data = zlib.compress(raw, 9)
+    parms = {"Predictor": 15, "Colors": 1, "BitsPerComponent": bits,
+             "Columns": width} if use_predictor else None
+    return data, parms
+
+
+def _reduced(bitmap: Image.Image, colours: int):
+    """Indices and colour table of ``bitmap`` reduced to ``colours`` colours.
+
+    Every table entry is the mean of the pixels it stands for, in the
+    components of the image itself (gray stays gray).
+    """
+    pixels = np.asarray(bitmap)
+    if pixels.ndim == 2:
+        pixels = pixels[:, :, None]
+    exact = imagedata.exact_palette(pixels, colours)
+    if exact is not None:
+        return exact
+    reduced = bitmap.quantize(colours, method=Image.Quantize.MEDIANCUT,
+                              dither=Image.Dither.NONE)
+    used, indices = np.unique(np.asarray(reduced), return_inverse=True)
+    indices = indices.reshape(pixels.shape[:2])
+    flat = indices.ravel()
+    weight = np.maximum(np.bincount(flat, minlength=len(used)), 1)
+    table = np.stack([np.bincount(flat, weights=pixels[:, :, channel].ravel(),
+                                  minlength=len(used)) / weight
+                      for channel in range(pixels.shape[2])], axis=1)
+    return indices.astype(np.uint8), np.rint(table).astype(np.uint8)
+
+
+def requantize(bitmap: Image.Image, stored: int, dpi: float | None,
+               minimum: float) -> Palette | None:
+    """The smallest palette version of a picture with few colours (a
+    screenshot, a diagram) that keeps the SSIM, or None.
+
+    JPEG rings around the sharp edges of such pictures; a colour table keeps
+    them sharp and the flat areas pack well.
+    """
+    width, height = bitmap.size
+    factor = view_factor(width, height, dpi)
+    view_size = (max(1, round(width * factor)), max(1, round(height * factor)))
+    reference = view_of(bitmap, view_size)
+    best = None
+    for colours in PALETTE_SIZES:
+        indices, table = _reduced(bitmap, colours)
+        shown = table[indices]
+        shown = Image.fromarray(shown[:, :, 0] if table.shape[1] == 1 else shown, bitmap.mode)
+        if ssim(reference, view_of(shown, view_size)) < min(1.0, minimum + SEARCH_MARGIN):
+            break       # fewer colours only look worse
+        bits = imagedata.index_bits(len(table))
+        rows = imagedata.pack_indices(indices, bits)
+        size = len(flate_rows(rows, bits, width, final=False)[0]) + table.size
+        if best is None or size < best[0]:
+            best = (size, rows, bits, table)
+    if best is None or best[0] >= stored * MIN_GAIN:
+        return None
+    _, rows, bits, table = best
+    data, parms = flate_rows(rows, bits, width, final=True)
+    if len(data) + table.size >= stored * MIN_GAIN:
+        return None
+    return Palette(data, parms, bits, table.tobytes(), len(table))
+
+
 # ------------------------------------------------------------------- driver --
 
 @dataclass
@@ -251,15 +343,31 @@ class Job:
     ncomp: int
     stored: int
     dpi: float | None
+    graphic: bool = False           # few colours: a palette, not a JPEG
+
+
+GRAY_PHOTO_LEVELS = 64      # a gray photo has more levels than this...
+GRAY_PHOTO_FLAT = 0.5       # ...and fewer pixels than this equal to their neighbour
 
 
 def _photographic(rows: np.ndarray, ncomp: int) -> bool:
-    """Flate pictures with many distinct colours are worth a JPEG."""
+    """Flate pictures that are worth a JPEG: photos, not drawings.
+
+    A colour photo has many distinct colours. Gray has 256 levels at most,
+    and an anti-aliased screenshot uses nearly all of them, so a gray photo
+    is told by its texture too: in a screenshot most pixels repeat their
+    left neighbour, in a photo or a scan few do.
+    """
     flat = rows.reshape(-1, ncomp) if rows.shape[1] % ncomp == 0 else None
     if flat is None or len(flat) < 4096:
         return False
     step = max(1, len(flat) // 65536)
     sample = np.ascontiguousarray(flat[::step])
+    if ncomp == 1:
+        if len(np.unique(sample)) <= GRAY_PHOTO_LEVELS:
+            return False
+        lines = rows[::max(1, rows.shape[0] // 256)]
+        return float((lines[:, 1:] == lines[:, :-1]).mean()) < GRAY_PHOTO_FLAT
     return len(np.unique(sample.view(np.dtype((np.void, sample.dtype.itemsize * ncomp))))) > 1500
 
 
@@ -293,9 +401,10 @@ def _extract(obj, dpi: float | None) -> Job | None:
         if any(f not in imagedata.GENERAL_FILTERS for f in filters) or stored < 20_000:
             return None
         rows = imagedata.raw_samples(obj, width, height, ncomp, 8)
-        if rows is None or not _photographic(rows, ncomp):
+        if rows is None:
             return None
-        return Job(obj.objgen, None, rows, width, height, ncomp, stored, dpi)
+        return Job(obj.objgen, None, rows, width, height, ncomp, stored, dpi,
+                   graphic=not _photographic(rows, ncomp))
     except (OSError, ValueError, KeyError, TypeError, pikepdf.PdfError):
         return None
 
@@ -305,9 +414,18 @@ def _run(job: Job, minimum: float, scratch: Path):
         bitmap = imagedata.bitmap_from(job.jpeg, job.rows, job.width, job.height, job.ncomp)
         if bitmap is None:
             return None
+        if job.graphic:
+            return requantize(bitmap, job.stored, job.dpi, minimum)
         return reencode(bitmap, job.stored, job.dpi, minimum, scratch)
     except (OSError, ValueError, MemoryError, Image.DecompressionBombError):
         return None
+
+
+def _write_palette(obj, palette: Palette) -> None:
+    """Store an image as indices; the table holds colours of its own colour
+    space, which becomes the base of an Indexed one."""
+    imagedata.write_indexed(obj, palette.data, palette.parms, palette.bits, palette.table,
+                  palette.count)
 
 
 def optimize_jpegs(pdf: pikepdf.Pdf, scratch: Path, minimum: float,
@@ -339,9 +457,13 @@ def optimize_jpegs(pdf: pikepdf.Pdf, scratch: Path, minimum: float,
             for (obj, job, _, pages), result in zip(batch, results):
                 if result is None:
                     continue
-                data, (width, height) = result
                 changes.append(Change(obj, pages, dict(obj.items()),
                                       bytes(obj.read_raw_bytes())))
+                if isinstance(result, Palette):
+                    _write_palette(obj, result)
+                    counts["palette"] += 1
+                    continue
+                data, (width, height) = result
                 obj.write(data, filter=Name.DCTDecode, decode_parms=None)
                 obj.Width, obj.Height = width, height
                 obj.BitsPerComponent = 8

@@ -19,8 +19,10 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
+import os
 from pathlib import Path
 import shutil
+import signal
 import zlib
 
 import numpy as np
@@ -572,18 +574,52 @@ def find_layers(job: PageJob, minimum: float, scratch: Path,
                   fg.image, page.minimum)
 
 
+def _page_process() -> None:
+    """A process that layers pages ends on Ctrl+C or a termination request:
+    a finished page is of no use to an interrupted run. Inside a page it
+    first unwinds, so the program it runs (``opj_compress``...) is killed by
+    ``subprocess.run`` and the page's work folder is removed; otherwise the
+    caller, which removes the folders around it, could race with them."""
+    for number in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(number, _end_now)
+
+
+class _PageStop(BaseException):
+    """Unwinds the page a page process is working on."""
+
+
+_PAGE_BUSY = False
+_PAGE_STOPPING = False
+
+
+def _end_now(signum, frame) -> None:
+    global _PAGE_STOPPING
+    if not _PAGE_BUSY:
+        os._exit(130)
+    if not _PAGE_STOPPING:      # a second request must not break the unwinding
+        _PAGE_STOPPING = True
+        raise _PageStop
+
+
 def _layer_job(args):
+    global _PAGE_BUSY
     job, minimum, relaxed, scratch, jpx = args
     if job is None:
         return None
     directory = scratch / f"mrc-{job.number}"
-    directory.mkdir(exist_ok=True)
+    _PAGE_BUSY = True
     try:
-        return find_layers(job, minimum, directory, relaxed, jpx)
-    except Exception:   # one odd page must not cost the other pages their layers
-        return None
+        try:
+            directory.mkdir(exist_ok=True)
+            return find_layers(job, minimum, directory, relaxed, jpx)
+        except Exception:   # one odd page must not cost the other pages their layers
+            return None
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+    except _PageStop:
+        os._exit(130)
     finally:
-        shutil.rmtree(directory, ignore_errors=True)
+        _PAGE_BUSY = False
 
 
 # ---------------------------------------------------------------- JBIG2 ----
@@ -767,7 +803,9 @@ def add_layers(pdf: pikepdf.Pdf, scratch: Path, minimum: float, jobs: int,
         return []
     results = []
     jpx = pdfa_part(pdf) != 1       # PDF/A-1 has no JPEG 2000
-    with ProcessPoolExecutor(max_workers=jobs) if jobs > 1 else _Inline() as pool:
+    pool_type = (ProcessPoolExecutor(max_workers=jobs, initializer=_page_process)
+                 if jobs > 1 else _Inline())
+    with pool_type as pool:
         stream = _bounded_map(
             pool, _layer_job,
             ((load_job(scan), minimum, relaxed, scratch, jpx) for scan in candidates),

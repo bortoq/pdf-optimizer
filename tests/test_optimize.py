@@ -159,11 +159,29 @@ class FontFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "f.pdf"
             make_font_pdf(path)
-            # The first (font-cutting) build "renders differently".
-            with patch("pdfopt.optimize.identical_pages", side_effect=[False, True]):
+            # The first (font-cutting) build "renders differently" on page 1,
+            # which shows the cut font: only that font is left alone.
+            with patch("pdfopt.optimize.changed_pages", side_effect=[[1], []]):
                 status, saved = optimize_pdf(path, "lossless", jobs=1)
-            self.assertIn("lossless-nofonts", status)
+            self.assertIn("lossless-fewer-fonts", status)
             self.assertGreater(saved, 0)
+
+    def test_a_difference_on_a_page_without_changed_fonts_drops_the_next_step(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "f.pdf"
+            make_font_pdf(path)
+            tries = []
+
+            def changed(first, second, pages, *args, **kwargs):
+                tries.append(Path(second).parent.name)
+                return [99] if len(tries) == 1 else []
+
+            with patch("pdfopt.optimize.changed_pages", changed):
+                status, _ = optimize_pdf(path, "lossless", jobs=1)
+            # Page 99 shows no changed font: the fewer-fonts try is skipped, and
+            # without font changes there is nothing left to render.
+            self.assertEqual(len(tries), 1)
+            self.assertIn("lossless-nofonts", status)
 
 
 class WorkerTests(unittest.TestCase):

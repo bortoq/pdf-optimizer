@@ -11,7 +11,8 @@ source ──► open (pikepdf) ─► signed/encrypted? ─► Skipped
 lossless.build ──► [thumbnails, dedupe] ─► [images, JPEG] ─► [fonts] ─► [ECT] ─► save
       │                                                                    │
       └── check: Fingerprint + pixel-identical changed pages ──────────────┘
-              │ failed → retry without font cutting, then without image changes
+              │ failed → retry without the fonts of the failing pages, then
+              │          without any font change, then without image changes
               ▼
          "lossless" stage (a candidate; in lossy mode also the base for the next ones)
               │
@@ -39,10 +40,12 @@ really have changed is checked.
   records whether a page has text: a `BT` operator in the page content or in its
   forms (unused fonts in the resources do not count; an unreadable stream counts
   as text). Ghostscript is offered only to documents without text.
-- `render.identical_pages` checks that the 100 dpi rendering of pages with
-  changed images or fonts is pixel-identical (RGB→Gray, 8→1 bit, JBIG2 generic,
-  predictors, cut fonts). If it fails, the build is repeated without font
-  cutting (if fonts were cut), then without image changes.
+- `render.changed_pages` lists the pages with changed images or fonts whose
+  100 dpi rendering is not pixel-identical (RGB→Gray, 8→1 bit, palettes, JBIG2
+  generic, predictors, cut or repacked fonts). If there are any, the build is
+  repeated without the font programs shown on those pages
+  (`lossless-fewer-fonts`; `lossless.Report.fonts` maps each changed program
+  to its pages), then without any font change, then without image changes.
 - `render.VisualGate` computes the SSIM of the 200 dpi rendering against a
   reference. The reference is rendered once (PNG, in parallel; a chunk is at
   most 8 pages and at most `ceil(pages / cores)`, otherwise 9 pages would use
@@ -58,11 +61,12 @@ really have changed is checked.
 | --- | --- | --- |
 | thumbnails | a viewer rebuilds `/Thumb` | page metadata untouched |
 | dedupe | streams with equal bytes and dictionary become one reference | identical data |
-| images | RGB(R=G=B)→Gray, {0,255}→1 bit, PNG predictor, G4/Flate→JBIG2 generic | pixel-identical rendering |
+| images | RGB(R=G=B)→Gray, {0,255}→1 bit, palette (≤256 RGB colours or ≤16 gray levels → `/Indexed`, 1/2/4/8-bit indices; not for masks, `/Decode`, `/Matte`), PNG predictor, G4/Flate→JBIG2 generic | pixel-identical rendering |
 | JPEG | mozjpeg's `jpegtran` (`mozjpeg-lossless-optimization`): Huffman tables and tuned progressive scans, markers are not copied; 0.7 % on photo scans, up to 28 % on smooth images beyond libjpeg's `jpegtran` | decoded pixels are compared |
-| fonts (`fonts.py`) | embedded TrueType (FontFile2) is cut by fontTools to the glyphs whose codes are shown by the text operators of pages, forms, annotation appearances, tiling patterns, soft masks and Type 3 glyphs; `retain_gids`, tables and hinting stay; the cmap tables are rebuilt after the cut (fontTools keeps only the requested Unicode values and empties the (1, 0) table of LibreOffice fonts without `/Encoding`). Left alone: documents with an AcroForm, Type0 fonts with an encoding other than Identity, font programs used by a font dictionary outside the walked resources (or a direct dictionary), and everything when a content stream cannot be parsed | content streams byte for byte; pages with changed fonts are pixel-identical |
+| fonts (`fonts.py`) | embedded TrueType (FontFile2) is cut by fontTools to the glyphs whose codes are shown by the text operators of pages, forms, annotation appearances, tiling patterns, soft masks and Type 3 glyphs; `retain_gids`, tables and hinting stay; the cmap tables are rebuilt after the cut (fontTools keeps only the requested Unicode values and empties the (1, 0) table of LibreOffice fonts without `/Encoding`). Embedded Type 1 (FontFile) is repacked as CFF (`type1.py`, FontFile3/Type1C): each glyph program is translated operator by operator (sidebearing into the first moveto, stems to `hstem`/`vstem`, hint replacement to `hstemhm` + `hintmask`, flex OtherSubrs to `flex`, `seac` written out), with the font's own encoding, matrix, blue zones and **bounding box** (fontTools would recompute it from the outlines; poppler sizes its glyph bitmaps by it, and the tighter box moved glyphs by a pixel). Unknown OtherSubrs, vertical advances, stroked fonts and a glyph under two codes leave the font alone; over 151 fonts of a test set none was refused and every page rendered identically (poppler and Ghostscript, 100 and 300 dpi). Left alone: cutting in documents with form fields (an empty AcroForm, as hyperref writes, does not count), Type0 fonts with an encoding other than Identity, font programs used by a font dictionary outside the walked resources (or a direct dictionary), and everything when a content stream cannot be parsed | content streams byte for byte; pages with changed fonts are pixel-identical |
 | ECT | recompresses Flate with the bundled compressor (`pdfopt/_ect`; it releases the GIL, so streams scale over cores): level 9, streams above 4 MB level 6 (`ect_mode`: 4–8 times faster, 0.03–0.3 % larger; a 25 MB image went from 38 s to about 5 s); a budget of 256 MB of unpacked data per document, Flate is never unpacked beyond the budget. ECT level 1 does not finish, so the module accepts only 2–9 | Deflate is lossless |
 | save | object streams + xref streams (qpdf) | - |
+| xref repack | the final file only: qpdf packs object and xref streams with zlib, so `repack_xref_streams` rewrites the saved file — object streams get ECT data, every object moves, the xref stream is written anew (PNG "Up" rows, ECT). 0.2–3 % of a file. Skipped for a classic xref table (PDF/A-1) and anything unexpected | reopened without repairs; every object, the trailer and all other stream data compared with the qpdf output |
 
 Images are read in the main thread (qpdf objects are not thread safe) and
 encoded in a thread pool, in windows of `2·jobs` images to bound memory.
@@ -140,8 +144,14 @@ Pages get their own resource dictionaries (copies), so shared or inherited
 - `optimize._Run.jpeg_stage` checks pages with re-encoded images by real
   rendering; images of pages below the threshold are restored
   (`jpegopt.revert`), the others stay.
-- Flate images with ≥1500 colours in the sample count as photos and become JPEG;
-  graphics stay Flate.
+- Flate images count as photos and become JPEG when they have ≥1500 colours
+  in the sample (RGB), or more than 64 levels and fewer than half the pixels
+  equal to their left neighbour (gray: an anti-aliased screenshot uses nearly
+  all 256 levels, but most of its pixels repeat). The others are graphics:
+  `requantize` tries 256, 64, 16 and 4 colours (median cut, each entry the
+  mean of its pixels) and keeps the smallest that passes SSIM, as an
+  `/Indexed` image over the original colour space; `revert` undoes it like a
+  JPEG.
 - Forms created by MRC are skipped, so layers are not re-encoded twice.
 
 ## Parallelism

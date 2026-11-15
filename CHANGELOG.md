@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+**Compression**
+- Type 1 fonts (pdfTeX, dvips) are repacked as CFF (`/FontFile3`, `Type1C`)
+  with the same outlines, widths, hints, flex and encoding. Their glyphs are
+  stored encrypted, which Flate cannot compress: papers shrink by half or more
+  (−2.6 → −57.7 %, −6.8 → −72.2 %) and lossless. Pages showing a repacked font
+  are compared pixel for pixel like every other change.
+- When the rendering check fails, only the fonts shown on the failing pages are
+  left alone (`lossless-fewer-fonts`); before, every font change was dropped.
+- An empty AcroForm (hyperref writes one into most papers) no longer stops the
+  font step; with form fields fonts are still not cut, but Type 1 fonts are
+  repacked (no glyph goes).
+- Lossless palettes: pictures with up to 256 RGB colours or 16 gray levels are
+  stored as indices into a colour table (`/Indexed`, 1–8 bits).
+- Object streams and the cross-reference stream of the result are packed with
+  ECT (qpdf uses zlib): 0.2–3 % of a file.
+- `-q`: gray Flate photos become JPEG (only colour ones did; a gray picture has
+  at most 256 levels, below the photo test of 1500 colours). Screenshots and
+  diagrams get the smallest palette (256…4 colours) that keeps the SSIM instead
+  of staying as they were. On a set of books and papers: −22.6 → −51.7 %,
+  −18.1 → −29.3 %, −50.4 → −86.9 % per file, lowest page SSIM unchanged.
+- On a set of 35 books and papers the lossless saving went from 25.2 % to 27.0 %.
+
+**Stopping a run (found by repeating `kill` under full CPU load)**
+- A termination request while worker processes were starting could leave a
+  worker that ignored all further requests, and the run never ended. Stop
+  signals are now held while workers start and released in each worker once
+  its handler is set.
+- MRC page processes (inside a worker) were not told when the run was
+  terminated, so a worker waited for them to finish their pages. They are
+  told now, and end after removing their page folder (their `opj_compress`
+  is killed with them).
+- A worker that had been stopped could take the next queued file (queued
+  tasks cannot be cancelled) or wait for ever on a queue lock held by a
+  stopped worker; two requests sent at once arrive as one signal. A stopped
+  worker now starts no other file and ends after its answer.
+- A work folder made at the moment of the interruption could stay behind
+  (`TemporaryDirectory` creates the folder before it can remove it). Work
+  folders are now named before they are made and removed after an
+  interruption in any case.
+- After an interruption the process ends without finalizing the interpreter,
+  which could crash in native code cut off in the middle (exit 130 instead of
+  a segmentation fault).
+
 **Audit fixes (second round)**
 - A damaged file can no longer stop a run. A page tree whose `/Parent` links form
   a loop made pdfopt hang for ever; a wrong object type in a page (`/Rotate` as a

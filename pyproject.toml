@@ -35,7 +35,7 @@ Issues = "https://github.com/bortoq/pdf-optimizer/issues"
 dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
 
 [project.scripts]
-pdfopt = "pdfopt.cli:main"
+pdfopt = "pdfopt.cli:run"
 
 [tool.setuptools]
 # MANIFEST.in puts the ECT sources into the sdist; the wheel only needs the

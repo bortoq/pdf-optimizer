@@ -13,10 +13,11 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import io
 from pathlib import Path
+import re
 import struct
 import tempfile
 import threading
@@ -42,6 +43,9 @@ pikepdf.settings.set_flate_compression_level(9)
 
 MIN_GAIN = 0.98            # an image rewrite must save at least 2 %
 MIN_JBIG2_PIXELS = 100_000
+# Most colours an image may have to be stored as indices: 256 fit a byte; a
+# gray image gains only when its indices are narrower than its samples.
+PALETTE_LIMIT = {1: 16, 3: 256}
 ECT_BUDGET = 256 << 20     # bytes of raw data re-deflated per document
 ECT_FAST_ABOVE = 4 << 20   # streams above this get ECT level 6 instead of 9
 
@@ -52,6 +56,9 @@ class Report:
 
     visual_pages: set[int]
     notes: list[str]
+    # Font programs that were changed -> zero-based pages showing them, so a
+    # failed rendering check can drop just the fonts of the failing pages.
+    fonts: dict[tuple, set[int]] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------- structure --
@@ -163,6 +170,7 @@ class ImageInput:
     can_threshold: bool = True      # may an exact black/white picture go 1-bit
     ccitt_source: bool = False
     can_gray: bool = True           # RGB->Gray keeps the dictionary valid (no /Decode)
+    can_index: bool = False         # may become indices into a colour table
 
 
 @dataclass
@@ -172,6 +180,7 @@ class Replacement:
     parms: pikepdf.Object | None
     updates: dict
     note: str
+    table: bytes | None = None      # colour table: the image becomes Indexed
 
 
 def _flate(data: bytes) -> bytes:
@@ -196,8 +205,19 @@ def _bilevel_rows(obj, width, height):
     return imagedata.raw_samples(obj, width, height, 1, 1)
 
 
-def extract(kind: str, obj) -> ImageInput | None:
-    """Read one image into plain Python/numpy data (main thread only)."""
+def _base_space(colorspace) -> bool:
+    """A colour space that may be the base of an Indexed one."""
+    return isinstance(colorspace, pikepdf.Name) or (
+        isinstance(colorspace, pikepdf.Array) and len(colorspace) > 0
+        and str(colorspace[0]) not in ("/Indexed", "/Pattern"))
+
+
+def extract(kind: str, obj, is_mask: bool = False) -> ImageInput | None:
+    """Read one image into plain Python/numpy data (main thread only).
+
+    ``is_mask`` marks an image used as a soft mask or a stencil of another
+    one: it has to stay DeviceGray.
+    """
     try:
         stored = len(obj.read_raw_bytes())
         if kind == "jpeg":
@@ -224,7 +244,9 @@ def extract(kind: str, obj) -> ImageInput | None:
         return ImageInput("raw", width, height, bits, ncomp, family, stored, rows,
                           can_threshold="/Matte" not in obj,
                           ccitt_source=filters_of(obj) == ["/CCITTFaxDecode"],
-                          can_gray="/Decode" not in obj)
+                          can_gray="/Decode" not in obj,
+                          can_index=(not is_mask and not mask and "/Decode" not in obj
+                                     and "/Matte" not in obj and _base_space(colorspace)))
     except (OSError, ValueError, KeyError, TypeError, pikepdf.PdfError):
         return None
 
@@ -289,28 +311,53 @@ def _rewrite_raw(item: ImageInput, scratch: Path, jbig2_ok: bool) -> Replacement
         bits = 1
         updates["/BitsPerComponent"] = 1
         notes.append("1bit")
-    candidates = []
+    candidates: list[tuple] = []
     if bits != 1 or not item.ccitt_source:
         data, parms = _predicted(rows, bits, ncomp, width)
-        candidates.append((data, Name.FlateDecode, parms))
+        candidates.append((data, Name.FlateDecode, parms, None))
     if bits == 1 and jbig2_ok:
         coded = _jbig2_generic(rows, width, height, scratch)
         if coded is not None:
-            candidates.append((coded, Name.JBIG2Decode, None))
-            notes.append("jbig2")
+            candidates.append((coded, Name.JBIG2Decode, None, None))
+    if bits == 8 and item.can_index and ncomp in (1, 3):
+        # A picture of few colours as indices into a table: a third of the
+        # samples for RGB, half or less for gray with up to 16 levels.
+        found = imagedata.exact_palette(
+            rows[:, :width * ncomp].reshape(height, width, ncomp), PALETTE_LIMIT[ncomp])
+        if found is not None:
+            indices, table = found
+            index_bits = imagedata.index_bits(len(table))
+            data, parms = _predicted(imagedata.pack_indices(indices, index_bits),
+                                     index_bits, 1, width)
+            candidates.append((data, Name.FlateDecode, parms, (index_bits, table.tobytes())))
     if not candidates:
         return None
-    data, filter_name, parms = min(candidates, key=lambda c: len(c[0]))
-    if len(data) >= item.stored * MIN_GAIN:
+    data, filter_name, parms, palette = min(
+        candidates, key=lambda c: len(c[0]) + (len(c[3][1]) if c[3] else 0))
+    if len(data) + (len(palette[1]) if palette else 0) >= item.stored * MIN_GAIN:
         return None
+    if filter_name == Name.JBIG2Decode:
+        notes.append("jbig2")
+    table = None
+    if palette is not None:
+        updates["/BitsPerComponent"], table = palette
+        notes.append("palette")
     return Replacement(data, filter_name, parms, updates,
-                       "+".join(notes) or "predictor")
+                       "+".join(notes) or "predictor", table)
 
 
 def _apply(obj, result: Replacement) -> None:
     obj.write(result.data, filter=result.filter, decode_parms=result.parms)
     for key, value in result.updates.items():
         obj[key] = value
+    if result.table is not None:
+        # The table holds colours of the image's own colour space (the one
+        # just set, for RGB that turned out gray), which becomes the base.
+        base = obj.get("/ColorSpace")
+        components = imagedata.components(base) or 1
+        obj.ColorSpace = pikepdf.Array([Name.Indexed, base,
+                                        len(result.table) // components - 1,
+                                        pikepdf.String(result.table)])
 
 
 def optimize_images(pdf: pikepdf.Pdf, scratch: Path, jobs: int, *,
@@ -321,6 +368,7 @@ def optimize_images(pdf: pikepdf.Pdf, scratch: Path, jobs: int, *,
     Returns the pages that need a visual check and a count of rewrites by kind.
     """
     tasks: dict[tuple, list] = {}   # objgen -> [kind, obj, pages]
+    masks: set[tuple] = set()       # images used as a mask of another image
 
     def add(kind, obj, pages):
         entry = tasks.setdefault(obj.objgen, [kind, obj, set()])
@@ -339,6 +387,7 @@ def optimize_images(pdf: pikepdf.Pdf, scratch: Path, jobs: int, *,
             child = obj.get(extra)
             if transforms and isinstance(child, pikepdf.Stream):
                 add("raw", child, ref.pages)
+                masks.add(child.objgen)
 
     visual: set[int] = set()
     counts: Counter = Counter()
@@ -349,7 +398,7 @@ def optimize_images(pdf: pikepdf.Pdf, scratch: Path, jobs: int, *,
         for start in range(0, len(entries), window):
             batch = []
             for offset, (kind, obj, pages) in enumerate(entries[start:start + window]):
-                item = extract(kind, obj)
+                item = extract(kind, obj, obj.objgen in masks)
                 if item is None:
                     continue
                 directory = Path(base) / f"{start + offset}"
@@ -451,12 +500,196 @@ def save(pdf: pikepdf.Pdf, target: Path, *, deflated: bool) -> None:
              fix_metadata_version=False, deterministic_id=True)
 
 
+# ------------------------------------------------- object and xref streams --
+#
+# qpdf builds the object streams and the cross-reference stream itself and
+# packs them with zlib; together they are about a tenth of a typical file, and
+# ECT makes them some 14 % smaller. They cannot be handed to qpdf already
+# packed, so the saved file is rewritten: the streams get new data, every
+# object moves, and the cross-reference stream is written anew.
+
+_OBJECT = re.compile(rb"(\d+) (\d+) obj\n<<(.*?)>>\nstream\n", re.S)
+_LENGTH = re.compile(rb"/Length (\d+)(?= |>|/|$)")
+
+
+def _int_array(text: bytes, key: bytes) -> list[int] | None:
+    found = re.search(re.escape(key) + rb" ?\[([\d\s]*)\]", text)
+    return [int(v) for v in found.group(1).split()] if found else None
+
+
+def _xref_rows(raw: bytes, columns: int, predictor: int | None) -> list[bytes] | None:
+    """The rows of a decoded cross-reference stream (PNG predictors undone)."""
+    if predictor is None:
+        return [raw[i:i + columns] for i in range(0, len(raw), columns)]
+    if predictor < 10:
+        return None
+    rows, previous = [], bytes(columns)
+    for start in range(0, len(raw), columns + 1):
+        kind, line = raw[start], bytearray(raw[start + 1:start + 1 + columns])
+        if kind == 2:
+            for i in range(columns):
+                line[i] = (line[i] + previous[i]) & 255
+        elif kind != 0:
+            return None             # qpdf writes only "None" and "Up" rows
+        rows.append(bytes(line))
+        previous = bytes(line)
+    return rows
+
+
+def repack_xref_streams(path: Path, jobs: int = 1) -> int:
+    """Pack the object streams and the cross-reference stream of a file that
+    pikepdf saved with ECT; returns the bytes saved (0 when nothing changed).
+
+    Anything unexpected leaves the file as it is, and the result is reopened
+    and compared with the original before it replaces it.
+    """
+    if _ectdeflate is None:
+        return 0
+    data = path.read_bytes()
+    try:
+        start = int(data[data.rindex(b"startxref") + 9:].split()[0])
+    except (ValueError, IndexError):
+        return 0
+    head = _OBJECT.match(data, start)
+    if head is None or b"/Type /XRef" not in head.group(3):
+        return 0                    # a classic xref table (PDF/A-1, old files)
+    xref_number, xref_dict = int(head.group(1)), head.group(3)
+    length = _LENGTH.search(xref_dict)
+    widths = _int_array(xref_dict, b"/W")
+    size = re.search(rb"/Size (\d+)", xref_dict)
+    index = _int_array(xref_dict, b"/Index") or ([0, int(size.group(1))] if size else None)
+    columns = sum(widths) if widths else 0
+    if (length is None or widths is None or len(widths) != 3 or index is None
+            or b"/Prev" in xref_dict or not columns):
+        return 0
+    predictor = re.search(rb"/Predictor (\d+)", xref_dict)
+    try:
+        raw = zlib.decompress(data[head.end():head.end() + int(length.group(1))])
+    except zlib.error:
+        return 0
+    rows = _xref_rows(raw, columns, int(predictor.group(1)) if predictor else None)
+    numbers = [n for first, count in zip(index[::2], index[1::2])
+               for n in range(first, first + count)]
+    if rows is None or len(rows) != len(numbers):
+        return 0
+
+    def field_value(row: bytes, number: int, default: int) -> int:
+        offset = sum(widths[:number])
+        part = row[offset:offset + widths[number]]
+        return int.from_bytes(part, "big") if part else default
+
+    entries = [(field_value(row, 0, 1), field_value(row, 1, 0), field_value(row, 2, 0))
+               for row in rows]
+    placed = sorted((entry[1], number) for number, entry in zip(numbers, entries)
+                    if entry[0] == 1)
+    if not placed or placed[-1] != (start, xref_number):
+        return 0
+    bounds = [offset for offset, _ in placed[1:]] + [len(data)]
+    objects = []                    # (number, bytes) in file order, xref last
+    for (offset, number), end in zip(placed, bounds):
+        if not data.startswith(b"%d 0 obj" % number, offset):
+            return 0
+        objects.append((number, data[offset:end]))
+
+    def repack(chunk: bytes) -> bytes:
+        found = _OBJECT.match(chunk)
+        if (found is None or b"/Type /ObjStm" not in found.group(3)
+                or b"/DecodeParms" in found.group(3)
+                or not re.search(rb"/Filter /FlateDecode\b", found.group(3))):
+            return chunk
+        size = _LENGTH.search(found.group(3))
+        if size is None:
+            return chunk
+        old = chunk[found.end():found.end() + int(size.group(1))]
+        try:
+            plain = zlib.decompress(old)
+        except zlib.error:
+            return chunk
+        new = deflate_zlib(plain, ect_mode(len(plain)))
+        if len(new) >= len(old):
+            return chunk
+        header = (chunk[:found.start(3)] + _LENGTH.sub(b"/Length %d" % len(new), found.group(3),
+                                                       count=1) + b">>\nstream\n")
+        return header + new + chunk[found.end() + len(old):]
+
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        packed = list(pool.map(repack, [chunk for _, chunk in objects[:-1]]))
+    out = bytearray(data[:placed[0][0]])
+    moved: dict[int, int] = {}
+    for (number, _), chunk in zip(objects, packed):
+        moved[number] = len(out)
+        out += chunk
+    moved[xref_number] = len(out)
+    if moved[xref_number] >= 256 ** widths[1]:
+        return 0
+    table = bytearray()
+    previous = bytes(columns + 1)
+    for number, (kind, second, third) in zip(numbers, entries):
+        line = b"".join(value.to_bytes(width, "big") for value, width in zip(
+            (kind, moved[number] if kind == 1 else second, third), widths))
+        table += b"\x02" + bytes((a - b) & 255 for a, b in zip(line, previous[1:]))
+        previous = b"\x02" + line
+    stream = deflate_zlib(bytes(table), 9)
+    parms = b"/DecodeParms << /Columns %d /Predictor 12 >>" % columns
+    text = re.sub(rb"/DecodeParms ?<<[^>]*>>", parms, xref_dict, count=1) if predictor \
+        else xref_dict + b" " + parms
+    text = _LENGTH.sub(b"/Length %d" % len(stream), text, count=1)
+    out += b"%d 0 obj\n<<%s>>\nstream\n" % (xref_number, text) + stream
+    out += b"\nendstream\nendobj\nstartxref\n%d\n%%%%EOF\n" % moved[xref_number]
+    if len(out) >= len(data):
+        return 0
+    candidate = path.with_name(path.name + ".repacked")
+    candidate.write_bytes(bytes(out))
+    try:
+        if not _same_objects(path, candidate):
+            return 0
+        saved = len(data) - len(out)
+        candidate.replace(path)
+        return saved
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
+def _token(value):
+    """A comparable form of a trailer entry: its object number if indirect."""
+    if isinstance(value, pikepdf.Object):
+        return value.objgen if value.is_indirect else value.unparse()
+    return repr(value)
+
+
+def _same_objects(first: Path, second: Path) -> bool:
+    """Both files open without repairs and hold the same objects."""
+    try:
+        with pikepdf.open(first) as a, pikepdf.open(second) as b:
+            if b.get_warnings() or len(a.objects) != len(b.objects):
+                return False
+            # The trailer is the dictionary of the xref stream: only the
+            # entries that are not about the stream itself must agree.
+            if any(_token(a.trailer.get(key)) != _token(b.trailer.get(key))
+                   for key in ("/Root", "/Info", "/ID", "/Encrypt", "/Size")):
+                return False
+            for x, y in zip(a.objects, b.objects):
+                if x.objgen != y.objgen or x.unparse() != y.unparse():
+                    return False
+                # The repacked streams differ by design; the objects they
+                # hold were compared above.
+                if isinstance(x, pikepdf.Stream) and x.get("/Type") not in (
+                        "/ObjStm", "/XRef") and x.read_raw_bytes() != y.read_raw_bytes():
+                    return False
+    except (pikepdf.PdfError, OSError, ValueError):
+        return False
+    return True
+
+
 def build(source: Path, target: Path, scratch: Path, jobs: int = 1, *,
           transforms: bool = True, jbig2: bool = True,
           ect: bool = True, cut_fonts: bool = True,
+          skip_fonts: frozenset = frozenset(),
           progress: Callback = nothing) -> Report:
     """Run the whole lossless pipeline from ``source`` into ``target``.
 
+    ``cut_fonts`` allows the font step (TrueType cutting, Type 1 to CFF);
+    ``skip_fonts`` lists font programs (``objgen``) it must leave alone.
     ``progress`` gets the completed fraction (0..1) of this call.
     """
     notes: list[str] = []
@@ -470,13 +703,17 @@ def build(source: Path, target: Path, scratch: Path, jobs: int = 1, *,
                                          transforms=transforms, jbig2=jbig2,
                                          progress=lambda f: progress(0.05 + 0.45 * f))
         notes.extend(f"{name}×{count}" for name, count in sorted(counts.items()))
+        changed: dict[tuple, set[int]] = {}
         if transforms and cut_fonts:
-            font_pages, cut = fonts.subset_fonts(pdf)
-            if cut:
-                visual |= font_pages
-                notes.append(f"fonts×{cut}")
+            found = fonts.subset_fonts(pdf, skip_fonts)
+            changed = found.programs
+            visual |= found.pages
+            if found.cut:
+                notes.append(f"fonts×{found.cut}")
+            if found.converted:
+                notes.append(f"type1→cff×{found.converted}")
         progress(0.55)
         deflated = ect_streams(pdf, jobs, lambda f: progress(0.55 + 0.35 * f)) if ect else False
         progress(0.9)
         save(pdf, target, deflated=deflated)
-    return Report(visual, notes)
+    return Report(visual, notes, changed)

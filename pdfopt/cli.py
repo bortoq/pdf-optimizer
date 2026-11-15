@@ -13,12 +13,20 @@ import queue
 import shutil
 import signal
 import sys
-import tempfile
+import threading
 import time
 
 from . import __version__, cache
 from .lossless import ect_available
-from .optimize import ALREADY, MIN_SSIM, MRC_ALLOWANCE, Outcome, find_worker, optimize_pdf
+from .optimize import (
+    ALREADY,
+    MIN_SSIM,
+    MRC_ALLOWANCE,
+    Outcome,
+    find_worker,
+    optimize_pdf,
+    remove_work_folders,
+)
 from .pdfmodel import Skipped
 
 
@@ -150,6 +158,7 @@ class _Interrupted(BaseException):
     """Ctrl+C or a termination request; unwinds quietly (temporary files are removed)."""
 
 
+_ENDING = False      # this worker was stopped: it starts no other file
 _BUSY = False        # a worker process is inside _process
 _STOPPING = False    # ... and is cleaning up after a signal
 _AGAIN = False       # ... and was told to stop once more meanwhile
@@ -158,6 +167,12 @@ _AGAIN = False       # ... and was told to stop once more meanwhile
 def _stop(signum, frame) -> None:
     """Ctrl+C or a termination request in a worker process."""
     global _STOPPING, _AGAIN
+    # Its own helper processes (MRC pages) are told too: a termination
+    # request reaches only this process, and the clean-up below would wait
+    # for them to finish their pages.
+    for child in multiprocessing.active_children():
+        with contextlib.suppress(OSError, ValueError):
+            child.terminate()
     if _STOPPING:
         _AGAIN = True       # must not break the clean-up; obeyed right after it
     elif not _BUSY:
@@ -170,10 +185,38 @@ def _stop(signum, frame) -> None:
 _TERMINATED = False
 
 
+_MAIN_PID = 0           # the process that runs main()
+_STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM}
+
+
 def _terminated(signum, frame) -> None:
     global _TERMINATED
+    if os.getpid() != _MAIN_PID:
+        # A worker just forked, before its own handler is set: it has
+        # nothing to clean up yet, and must not inherit the steps below.
+        os._exit(130)
     _TERMINATED = True
+    # Once is enough: a second request must not break the clean-up.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise KeyboardInterrupt
+
+
+@contextlib.contextmanager
+def _signals_held():
+    """Hold Ctrl+C and termination requests while worker processes start.
+
+    A forked worker inherits the mask, so no signal reaches it before it has
+    set its own handler (``_init_worker`` releases them). A request that
+    comes meanwhile is delivered to this process when the block ends.
+    """
+    if not hasattr(signal, "pthread_sigmask"):     # Windows
+        yield
+        return
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def _init_worker(channel, known: set[str]) -> None:
@@ -184,6 +227,13 @@ def _init_worker(channel, known: set[str]) -> None:
     # workers just stop. Programs started by a worker get the default action.
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
+    if hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, _STOP_SIGNALS)
+
+
+def _end_soon(delay: float = 2.0) -> None:
+    time.sleep(delay)
+    os._exit(130)
 
 
 def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | None]:
@@ -197,6 +247,11 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | N
     """
     (path, mode, dry_run, min_ssim, mrc_ssim, jobs, force, safe_text, verbose,
      decrypt, output, settings) = task
+    global _BUSY, _STOPPING, _ENDING
+    if _ENDING:
+        # Tasks already sit in this worker's queue when the run is stopped
+        # (cancelling them is no longer possible): none is started.
+        return str(path), "interrupted", 0, "interrupted", None, None
     if emit is None and _PROGRESS is not None:
         def emit(name: str, fraction: float) -> None:
             _PROGRESS.put((name, fraction))
@@ -212,7 +267,6 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | N
             last[0] = fraction
             emit(str(path), fraction)
 
-    global _BUSY, _STOPPING
     work = path
     _BUSY = True
 
@@ -235,11 +289,11 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | N
             # Work on a copy: the source stays as it is. The copy is also the
             # result of files that need no change or are skipped. It gets the
             # name of the output only when it is complete.
+            # The name is known before the file exists, so an interruption at
+            # any point finds it for the clean-up (one name per process: no two
+            # running processes share it).
             output.parent.mkdir(parents=True, exist_ok=True)
-            handle, name = tempfile.mkstemp(prefix=WORK_PREFIX, suffix=".pdf",
-                                            dir=output.parent)
-            os.close(handle)
-            work = Path(name)
+            work = output.parent / f"{WORK_PREFIX}{os.getpid()}-{output.name}"
             shutil.copy2(path, work)
         if key is not None and key in _KNOWN:
             outcome = Outcome(NO_GAIN_KNOWN, 0)
@@ -255,9 +309,15 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | N
         return str(path), "ok", saved, status, quality, key if status == NO_GAIN else None
     except (KeyboardInterrupt, _Interrupted):
         discard()
-        if _AGAIN:
-            # The pool is being torn down and waits for this process to end.
-            os._exit(130)
+        remove_work_folders()
+        if _PROGRESS is not None:
+            _ENDING = True
+            # In a worker process: the run is ending, so this process ends
+            # too, shortly after its answer is sent. Waiting for the next
+            # task could block for ever on a queue lock held by a worker that
+            # was stopped, and a second request may never come (two requests
+            # sent at once arrive as one signal).
+            threading.Thread(target=_end_soon, daemon=True).start()
         return str(path), "interrupted", 0, "interrupted", None, None
     except Skipped as exc:
         try:
@@ -273,6 +333,12 @@ def _process(task, emit=None) -> tuple[str, str, int, str, tuple | None, str | N
         return str(path), "failed", 0, f"error: {text}", None, None
     finally:
         _BUSY = _STOPPING = False
+        if _AGAIN:
+            # A request to stop came while this one was cleaning up: the pool
+            # is being torn down and waits for this process to end. Obeyed
+            # however the file ended; waiting for the next task could block
+            # for ever on a queue lock that a stopped worker held.
+            os._exit(130)
 
 
 def _size(path: Path) -> int:
@@ -443,44 +509,53 @@ def main(argv: list[str] | None = None) -> int:
         bar.draw(0.0, 0, 0, 0, "", force=True)
     # A termination request (kill, docker stop, timeout) ends the run like
     # Ctrl+C: work folders are removed and the sources stay unchanged.
-    global _TERMINATED
+    global _TERMINATED, _MAIN_PID
     _TERMINATED = False
+    _MAIN_PID = os.getpid()
     previous = signal.signal(signal.SIGTERM, _terminated) if _main_thread() else None
     try:
         if parallel > 1:
             channel: multiprocessing.Queue = multiprocessing.Queue()
-            with ProcessPoolExecutor(max_workers=parallel, initializer=_init_worker,
-                                     initargs=(channel, no_gain)) as pool:
-                running = {pool.submit(_process, task) for task in tasks}
-                try:
-                    while running:
-                        finished, running = wait(running, timeout=0.1,
-                                                 return_when=FIRST_COMPLETED)
-                        try:
-                            while True:
-                                progress(*channel.get_nowait())
-                        except queue.Empty:
-                            pass
-                        for future in finished:
+            pool = ProcessPoolExecutor(max_workers=parallel, initializer=_init_worker,
+                                       initargs=(channel, no_gain))
+            running: set = set()
+            # The interruption may come at any point here, also while the
+            # tasks are handed out: the workers are told in every case, or
+            # the pool would wait for them to finish their files.
+            try:
+                with _signals_held():
+                    for task in tasks:
+                        running.add(pool.submit(_process, task))
+                while running:
+                    finished, running = wait(running, timeout=0.1,
+                                             return_when=FIRST_COMPLETED)
+                    try:
+                        while True:
+                            progress(*channel.get_nowait())
+                    except queue.Empty:
+                        pass
+                    for future in finished:
+                        report(future.result())
+                    if interrupted:     # a worker was stopped: stop the rest
+                        raise KeyboardInterrupt
+            except KeyboardInterrupt:
+                for future in running:
+                    future.cancel()
+                if _TERMINATED:
+                    # Unlike Ctrl+C, a termination request reaches only this
+                    # process: pass it on.
+                    for worker in list((getattr(pool, "_processes", None) or {}).values()):
+                        with contextlib.suppress(OSError, ValueError):
+                            worker.terminate()
+                # Workers were stopped by the same Ctrl+C; collect them. One
+                # that was stopped before it could answer has no result.
+                for future in wait(running)[0]:
+                    if not future.cancelled():
+                        with contextlib.suppress(Exception):
                             report(future.result())
-                        if interrupted:     # a worker was stopped: stop the rest
-                            raise KeyboardInterrupt
-                except KeyboardInterrupt:
-                    for future in running:
-                        future.cancel()
-                    if _TERMINATED:
-                        # Unlike Ctrl+C, a termination request reaches only
-                        # this process: pass it on.
-                        for worker in list((getattr(pool, "_processes", None) or {}).values()):
-                            with contextlib.suppress(OSError, ValueError):
-                                worker.terminate()
-                    # Workers were stopped by the same Ctrl+C; collect them.
-                    # One that was stopped before it could answer has no result.
-                    for future in wait(running)[0]:
-                        if not future.cancelled():
-                            with contextlib.suppress(Exception):
-                                report(future.result())
-                    raise
+                raise
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
         else:
             for task in tasks:
                 report(_process(task, progress))
@@ -511,3 +586,20 @@ def main(argv: list[str] | None = None) -> int:
           (f"; already optimized: {known} (use --force to process again)" if known else "") +
           (f"; errors: {failures}" if failures else ""))
     return 1 if failures else 0
+
+
+def run() -> None:
+    """The ``pdfopt`` command: ``main`` with the process exit code.
+
+    After an interruption the work is unwound and every temporary file is
+    gone; the process then ends at once instead of finalizing the interpreter,
+    which can crash in native code that was cut off in the middle (seen as a
+    segmentation fault on exit under heavy load).
+    """
+    code = main()
+    if code == 130:
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
+        os._exit(130)
+    sys.exit(code)

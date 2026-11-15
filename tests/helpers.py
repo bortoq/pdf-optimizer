@@ -257,7 +257,7 @@ def truetype_font(glyphs: int = 200, *, mac_only: bool = False) -> bytes:
 
 
 def make_font_pdf(path: Path, *, kind: str = "simple", text: str = "ABAC",
-                  in_form: bool = False, annotation: bool = False, acroform: bool = False,
+                  in_form: bool = False, annotation: bool = False, acroform: bool | str = False,
                   orphan_user: bool = False, encoding: str = "/Identity-H",
                   mac_only: bool = False) -> None:
     """A page showing ``text`` with an embedded TrueType font.
@@ -319,5 +319,141 @@ def make_font_pdf(path: Path, *, kind: str = "simple", text: str = "ABAC",
             Type=Name.Annot, Subtype=Name.Stamp, Rect=[250, 20, 350, 70],
             AP=Dictionary(N=appearance)))]))
     if acroform:
-        pdf.Root.AcroForm = Dictionary(Fields=[], DR=resources)
+        # A text field; acroform="empty" gives the empty form hyperref writes.
+        fields = [] if acroform == "empty" else [
+            pdf.make_indirect(Dictionary(FT=Name.Tx, T=pikepdf.String("name")))]
+        pdf.Root.AcroForm = Dictionary(Fields=fields, DR=resources)
+    pdf.save(path)
+
+
+# ---------------------------------------------------------------- Type 1 --
+
+def _t1_charstring(program: list) -> bytes:
+    """A Type 1 glyph program, encrypted as it is stored (lenIV 4)."""
+    from fontTools.misc import eexec
+    from fontTools.misc.psCharStrings import T1CharString
+    charstring = T1CharString(program=program)
+    charstring.compile()
+    return eexec.encrypt(b"\0\0\0\0" + charstring.bytecode, 4330)[0]
+
+
+# Standard Subrs 0-3 (flex and hint replacement) and one with new stems.
+_T1_SUBRS = [
+    [3, 0, "callothersubr", "pop", "pop", "setcurrentpoint", "return"],
+    [0, 1, "callothersubr", "return"],
+    [0, 2, "callothersubr", "return"],
+    ["return"],
+    [300, 40, "hstem", 400, 60, "vstem", "return"],
+]
+
+# A triangle with stems, a curve with flex, a glyph that replaces its hints on
+# the way, an accent and an accented character made with seac.
+_T1_GLYPHS = {
+    ".notdef": [0, 500, "hsbw", "endchar"],
+    "A": [50, 600, "hsbw", 0, 50, "hstem", 100, 60, "vstem",
+          0, 0, "rmoveto", 500, 0, "rlineto", -250, 700, "rlineto", "closepath",
+          "endchar"],
+    "B": [40, 620, "hsbw",
+          0, 0, "rmoveto", 500, "hlineto", 300, "vlineto",
+          1, "callsubr",
+          -250, 20, "rmoveto", 2, "callsubr",       # reference point
+          -50, 0, "rmoveto", 2, "callsubr",
+          -100, 20, "rmoveto", 2, "callsubr",
+          -100, 0, "rmoveto", 2, "callsubr",
+          -100, -20, "rmoveto", 2, "callsubr",
+          -100, 0, "rmoveto", 2, "callsubr",
+          -50, -20, "rmoveto", 2, "callsubr",
+          50, 40, 300, 0, "callsubr",              # flex depth, end point
+          "closepath", "endchar"],
+    "C": [30, 640, "hsbw", 0, 40, "hstem", 80, 60, "vstem",
+          0, 0, "rmoveto", 560, 0, 0, 300, -280, 300, "rrcurveto",
+          4, 1, 3, "callothersubr", "pop", "callsubr",   # new hints from Subr 4
+          -280, 0, 0, -300, 0, -300, "rrcurveto", "closepath",
+          600, 3, "div", 0, "rmoveto", 40, "hlineto", 40, "vlineto", -40, "hlineto",
+          "closepath", "endchar"],
+    "grave": [80, 300, "hsbw", 0, 750, "rmoveto", 120, 0, "rlineto",
+              60, 120, "rlineto", -80, 0, "rlineto", "closepath", "endchar"],
+    "Agrave": [50, 600, "hsbw", 80, 200, 50, 65, 193, "seac"],
+}
+
+
+def type1_font(*, othersubr: int | None = None, paint_type: int = 0,
+               duplicate_code: bool = False) -> tuple[bytes, int, int, int]:
+    """A small Type 1 font program -> (data, Length1, Length2, Length3).
+
+    Codes: A=65, B=66, C=67, Agrave=68 (not StandardEncoding, so the font
+    carries its own encoding), grave=193. ``othersubr`` adds a call of an
+    OtherSubr the converter does not know; ``duplicate_code`` shows A under
+    two codes.
+    """
+    from fontTools.misc import eexec
+    glyphs = dict(_T1_GLYPHS)
+    if othersubr is not None:
+        glyphs["A"] = [*glyphs["A"][:-1], 0, othersubr, "callothersubr", "endchar"]
+    codes = {65: "A", 66: "B", 67: "C", 68: "Agrave", 193: "grave"}
+    if duplicate_code:
+        codes[69] = "A"
+    clear = (
+        "%!PS-AdobeFont-1.0: PdfoptTest 001\n"
+        "11 dict begin\n"
+        "/FontInfo 2 dict dup begin /FullName (Pdfopt Test) readonly def"
+        " /ItalicAngle 0 def end readonly def\n"
+        "/FontName /PdfoptTest def\n"
+        f"/PaintType {paint_type} def\n"
+        "/FontType 1 def\n"
+        "/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n"
+        "/Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\n"
+        + "".join(f"dup {code} /{name} put\n" for code, name in codes.items())
+        + "readonly def\n"
+        "/FontBBox {-50 -250 1000 950} readonly def\n"
+        "currentdict end\ncurrentfile eexec\n").encode("latin-1")
+    private = bytearray(
+        b"dup /Private 9 dict dup begin\n"
+        b"/RD {string currentfile exch readstring pop} executeonly def\n"
+        b"/ND {noaccess def} executeonly def\n"
+        b"/NP {noaccess put} executeonly def\n"
+        b"/BlueValues [-15 0 700 715] ND\n/StdHW [40] ND\n/StdVW [60] ND\n"
+        b"/MinFeature {16 16} ND\n/password 5839 def\n/lenIV 4 def\n")
+    private += b"/Subrs %d array\n" % len(_T1_SUBRS)
+    for index, subr in enumerate(_T1_SUBRS):
+        code = _t1_charstring(subr)
+        private += b"dup %d %d RD " % (index, len(code)) + code + b" NP\n"
+    private += b"ND\n2 index /CharStrings %d dict dup begin\n" % len(glyphs)
+    for name, glyph in glyphs.items():
+        code = _t1_charstring(glyph)
+        private += b"/%s %d RD " % (name.encode(), len(code)) + code + b" ND\n"
+    private += (b"end\nend\nreadonly put\nnoaccess put\n"
+                b"dup /FontName get exch definefont pop\nmark currentfile closefile\n")
+    secret = eexec.encrypt(b"\0\0\0\0" + bytes(private), 55665)[0]
+    trailer = b"\n" + (b"0" * 64 + b"\n") * 8 + b"cleartomark\n"
+    return clear + secret + trailer, len(clear), len(secret), len(trailer)
+
+
+def make_type1_pdf(path: Path, *, text: bytes = b"ABCD", font: tuple | None = None,
+                   pages: int = 1, orphan_user: bool = False) -> None:
+    """Pages showing ``text`` in an embedded Type 1 font (built-in encoding).
+
+    ``orphan_user`` adds a second font dictionary with the same program that
+    no page uses (so the converter cannot know where it is shown).
+    """
+    data, length1, length2, length3 = font or type1_font()
+    pdf = Pdf.new()
+    program = pdf.make_stream(data)
+    program.Length1, program.Length2, program.Length3 = length1, length2, length3
+    descriptor = pdf.make_indirect(Dictionary(
+        Type=Name.FontDescriptor, FontName=Name("/PdfoptTest"), Flags=32,
+        FontBBox=[-50, -250, 1000, 950], ItalicAngle=0, Ascent=950, Descent=-250,
+        CapHeight=700, StemV=60, FontFile=program))
+    font_dict = pdf.make_indirect(Dictionary(
+        Type=Name.Font, Subtype=Name.Type1, BaseFont=Name("/PdfoptTest"),
+        FirstChar=65, LastChar=68, Widths=[600, 620, 640, 600],
+        FontDescriptor=descriptor))
+    if orphan_user:
+        pdf.Root.Unused = pdf.make_indirect(Dictionary(
+            Type=Name.Font, Subtype=Name.Type1, BaseFont=Name("/PdfoptTest"),
+            FontDescriptor=descriptor))
+    content = b"BT /F1 48 Tf 40 300 Td (" + text + b") Tj 0 -80 Td 0.6 0 0 0.6 0 0 Tm" \
+              b" (" + text + b") Tj ET"
+    for _ in range(pages):
+        _page(pdf, 400, 400, content, Dictionary(Font=Dictionary(F1=font_dict)))
     pdf.save(path)

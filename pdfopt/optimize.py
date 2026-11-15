@@ -28,7 +28,7 @@ from .pdfmodel import (
     set_marker,
 )
 from .progress import Callback, Span, nothing
-from .render import VisualGate, identical_pages
+from .render import VisualGate, changed_pages
 from .tools import ToolError, last_line, require, run, which
 
 MIN_SSIM = 0.96
@@ -61,6 +61,15 @@ class Candidate:
     content: bool = False        # page content streams must be byte-identical
     metadata: bool = False
     verified: bool = False
+
+
+class RenderingChanged(ValueError):
+    """Pages of a lossless candidate do not render as in the source."""
+
+    def __init__(self, pages: list[int]):
+        shown = ", ".join(map(str, pages[:8])) + (", ..." if len(pages) > 8 else "")
+        super().__init__(f"PDF: rendering changed in lossless mode (pages {shown})")
+        self.pages = pages      # 1-based
 
 
 @dataclass
@@ -203,19 +212,34 @@ class _Run:
     # -- the lossless stage ------------------------------------------------
 
     def lossless_stage(self, progress: Callback = nothing) -> Candidate | None:
-        """Build and verify the pure lossless result (also the lossy base)."""
-        cut = True
-        for label, options in (("lossless", {}),
-                               ("lossless-nofonts", {"cut_fonts": False}),
-                               ("lossless-safe", {"transforms": False})):
-            if label == "lossless-nofonts" and not cut:
-                continue        # fonts were not the cause: the next try drops more
+        """Build and verify the pure lossless result (also the lossy base).
+
+        When the rendering check fails, the next try leaves alone the font
+        programs shown on the failing pages; then all fonts; then every image
+        change too.
+        """
+        skip: set[tuple] = set()
+        suspects: set[tuple] = set()
+        fonts_changed = True
+        for label in ("lossless", "lossless-fewer-fonts", "lossless-nofonts",
+                      "lossless-safe"):
+            options: dict = {}
+            if label == "lossless-fewer-fonts":
+                if not suspects:
+                    continue    # the failing pages show no changed font
+                options = {"skip_fonts": frozenset(skip)}
+            elif label == "lossless-nofonts":
+                if not fonts_changed:
+                    continue    # fonts were not the cause: the next try drops more
+                options = {"cut_fonts": False}
+            elif label == "lossless-safe":
+                options = {"transforms": False}
             work = self.directory(label)
             target = work / "out.pdf"
+            report = None
             try:
                 report = lossless.build(self.path, target, work, self.jobs,
                                         progress=lambda f: progress(0.8 * f), **options)
-                cut = any(note.startswith("fonts") for note in report.notes)
                 candidate = Candidate(label, target, target.stat().st_size,
                                       exact_pages=[p + 1 for p in sorted(report.visual_pages)],
                                       content=True, metadata=True)
@@ -223,8 +247,18 @@ class _Run:
                 candidate.verified = True
                 self.log(f"{label}: {candidate.size} bytes ({', '.join(report.notes) or '-'})")
                 return candidate
+            except RenderingChanged as exc:
+                self.fail(label, exc)
+                if report is not None:
+                    bad = {page - 1 for page in exc.pages}
+                    suspects = {program for program, pages in report.fonts.items()
+                                if pages & bad} - skip
+                    skip |= suspects
+                    fonts_changed = bool(report.fonts)
             except Exception as exc:
                 self.fail(label, exc)
+                suspects = set()
+                fonts_changed = report is None or bool(report.fonts)
         return None
 
     # -- verification ------------------------------------------------------
@@ -237,10 +271,12 @@ class _Run:
         exact = bool(candidate.exact_pages)
         gated = candidate.gate_pages is None or bool(candidate.gate_pages)
         share = 0.5 if exact and gated else 1.0
-        if exact and not identical_pages(
-                self.path, candidate.path, candidate.exact_pages,
-                self.directory("exact"), self.jobs, lambda f: progress(share * f)):
-            raise ValueError("PDF: rendering changed in lossless mode")
+        if exact:
+            changed = changed_pages(self.path, candidate.path, candidate.exact_pages,
+                                    self.directory("exact"), self.jobs,
+                                    lambda f: progress(share * f))
+            if changed:
+                raise RenderingChanged(changed)
         if gated:
             pages = (list(range(1, len(self.baseline.pages) + 1))
                      if candidate.gate_pages is None else candidate.gate_pages)
@@ -364,11 +400,14 @@ def _pick(run_: _Run, candidates: list[Candidate],
     return None
 
 
-def _stamp(candidate: Candidate, lossy: bool, quality: int | None, target: Path) -> Path:
-    """Write the optimizer marker into the winner (a cheap lossless re-save)."""
+def _stamp(candidate: Candidate, lossy: bool, quality: int | None, target: Path,
+           jobs: int = 1) -> Path:
+    """Write the optimizer marker into the winner (a cheap lossless re-save),
+    then pack its object and xref streams with ECT."""
     with open_pdf(candidate.path) as pdf:
         set_marker(pdf, lossy, quality)
         lossless.save(pdf, target, deflated=True)
+    lossless.repack_xref_streams(target, jobs)
     return target
 
 
@@ -385,6 +424,36 @@ def _flush(path: Path) -> None:
         pass
     finally:
         os.close(handle)
+
+
+_FOLDERS: set[Path] = set()     # work folders of this process that may still exist
+_SEQUENCE = itertools.count()
+
+
+@contextlib.contextmanager
+def work_folder(parent: Path | None, prefix: str):
+    """A private work folder, removed afterwards (like TemporaryDirectory).
+
+    Its name is known before it exists: an interruption at any point (even
+    while the folder is made, which TemporaryDirectory cannot survive)
+    leaves it in ``_FOLDERS`` for ``remove_work_folders``.
+    """
+    base = Path(parent) if parent is not None else Path(tempfile.gettempdir())
+    path = base / f"{prefix}{os.getpid()}-{next(_SEQUENCE)}-{os.urandom(3).hex()}"
+    _FOLDERS.add(path)
+    try:
+        path.mkdir(mode=0o700)
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+        _FOLDERS.discard(path)
+
+
+def remove_work_folders() -> None:
+    """Remove what an interrupted run left of its work folders."""
+    for path in list(_FOLDERS):
+        shutil.rmtree(path, ignore_errors=True)
+        _FOLDERS.discard(path)
 
 
 def _scratch_parent(path: Path, dry_run: bool) -> Path | None:
@@ -430,9 +499,8 @@ def optimize_pdf(path: Path, mode: str = "lossless", *, dry_run: bool = False,
 
     if not decrypt:
         return optimize(path)
-    with tempfile.TemporaryDirectory(prefix=".pdfopt-open-",
-                                     dir=_scratch_parent(path, dry_run)) as keep:
-        return optimize(_decrypted(path, Path(keep)))
+    with work_folder(_scratch_parent(path, dry_run), ".pdfopt-open-") as keep:
+        return optimize(_decrypted(path, keep))
 
 
 def _decrypted(path: Path, directory: Path) -> Path:
@@ -481,9 +549,7 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
     if worker is not None and which("pdftoppm") is None:
         raise ValueError("PDF: pdftoppm is needed to check Hyper Compress")
 
-    with tempfile.TemporaryDirectory(prefix=".pdfopt-",
-                                     dir=_scratch_parent(path, dry_run)) as directory:
-        scratch = Path(directory)
+    with work_folder(_scratch_parent(path, dry_run), ".pdfopt-") as scratch:
         state = _Run(work, mode, min_ssim, jobs, scratch, baseline, log, safe_text,
                      mrc_ssim, progress)
         candidates: list[Candidate] = []
@@ -523,7 +589,7 @@ def _optimize(path: Path, work: Path, mode: str, *, dry_run: bool, min_ssim: flo
             if not candidates and state.errors:
                 raise ValueError("PDF: " + "; ".join(state.errors))
             return Outcome("no change", 0)
-        final = _stamp(best, lossy, quality, scratch / "stamped.pdf")
+        final = _stamp(best, lossy, quality, scratch / "stamped.pdf", jobs)
         size = final.stat().st_size
         if size >= source_stat.st_size:
             return Outcome("no change", 0)

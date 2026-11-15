@@ -8,7 +8,8 @@ pdfopt/
   cache.py      files known to gain nothing (user's cache folder)
   optimize.py   orchestrator: stages, candidates, verification, marker, atomic replace
   lossless.py   lossless passes (structure, images, JPEG, ECT, save)
-  fonts.py      TrueType subsetting
+  fonts.py      TrueType subsetting, Type 1 repacking (driver)
+  type1.py      Type 1 font program -> CFF
   jpegopt.py    lossy photo recompression
   mrc.py        layered scan compression
   pdfmodel.py   reading: signature, page fingerprint, marker, image walk

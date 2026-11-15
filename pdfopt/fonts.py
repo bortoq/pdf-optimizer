@@ -1,4 +1,5 @@
-"""Cutting embedded TrueType fonts down to the glyphs a document shows.
+"""Making embedded fonts smaller: TrueType cut to the glyphs a document
+shows, Type 1 repacked as CFF (see ``type1.py``).
 
 Office and PDF printers often embed whole fonts (or "subsets" that are not
 cut at all): a 329 KB Calibri for a handful of characters. The text drawing
@@ -9,9 +10,11 @@ ids, so content streams stay byte-identical. Pages showing a changed font
 are verified pixel-for-pixel by the lossless stage.
 
 Anything unclear leaves a font alone: a content stream that cannot be
-parsed, an AcroForm (field appearances may be regenerated from its fonts),
-a Type0 font with an encoding other than Identity, or a font program also
-used by a font dictionary that was not found in the walked resources.
+parsed, a Type0 font with an encoding other than Identity, or a font program
+also used by a font dictionary that was not found in the walked resources.
+With form fields nothing is cut (field appearances may be regenerated from
+the form's fonts with any character); an empty AcroForm, as hyperref writes,
+does not count.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from fontTools.ttLib import TTFont
 import pikepdf
 from pikepdf import Name
 
+from . import type1
 from .pdfmodel import page_resources
 
 # fontTools warns about every slightly malformed table of a font; the font is
@@ -150,10 +154,11 @@ def _descriptor(font):
     return font.get("/FontDescriptor") if font is not None else None
 
 
-def _font_file(font):
+def _font_file(font, key: str = "/FontFile2"):
+    """The embedded program of a font (TrueType unless ``key`` says otherwise)."""
     descriptor = _descriptor(font)
     if isinstance(descriptor, pikepdf.Dictionary):
-        stream = descriptor.get("/FontFile2")
+        stream = descriptor.get(key)
         if isinstance(stream, pikepdf.Stream):
             return stream
     return None
@@ -253,14 +258,32 @@ def _subset(data: bytes, gids: set[int]) -> bytes:
     return output.getvalue()
 
 
-def subset_fonts(pdf: pikepdf.Pdf) -> tuple[set[int], int]:
-    """Cut embedded TrueType programs to the glyphs in use, in place.
+class FontChanges:
+    """What ``subset_fonts`` changed: every font program it rewrote, with the
+    zero-based pages that show it (to be verified pixel-for-pixel)."""
 
-    Returns the zero-based pages that show a changed font (to be verified
-    pixel-for-pixel) and the number of font programs cut.
+    def __init__(self):
+        self.programs: dict[tuple, set[int]] = {}
+        self.cut = 0            # TrueType programs cut to the glyphs in use
+        self.converted = 0      # Type 1 programs repacked as CFF
+
+    @property
+    def pages(self) -> set[int]:
+        return {page for pages in self.programs.values() for page in pages}
+
+
+def subset_fonts(pdf: pikepdf.Pdf, skip: frozenset = frozenset(),
+                 convert: bool = True) -> FontChanges:
+    """Make embedded font programs smaller, in place: TrueType programs are
+    cut to the glyphs in use; Type 1 programs (with ``convert``) are repacked
+    as CFF with the same outlines. Programs whose ``objgen`` is in ``skip``
+    are left alone (a rendering check found a difference on their pages).
     """
-    if "/AcroForm" in pdf.Root:
-        return set(), 0
+    changes = FontChanges()
+    # Field appearances may be regenerated from the form's fonts with any
+    # character, so with form fields no glyph may go. Repacking a Type 1
+    # program keeps every glyph and is still done.
+    may_cut = not _has_fields(pdf)
     usage = _Usage()
     try:
         for number, page in enumerate(pdf.pages):
@@ -274,7 +297,7 @@ def subset_fonts(pdf: pikepdf.Pdf) -> tuple[set[int], int]:
                     for stream in streams:
                         usage.content(stream, stream.get("/Resources"), number, None)
     except (_Unparsed, RecursionError):
-        return set(), 0
+        return changes
 
     # Font programs with every user known (shared programs need all users).
     # Font dictionaries are recognized by subtype (/Type is often missing);
@@ -292,10 +315,8 @@ def subset_fonts(pdf: pikepdf.Pdf) -> tuple[set[int], int]:
         else:
             unsafe.add(stream.objgen)
 
-    pages: set[int] = set()
-    count = 0
     for key, fonts in users.items():
-        if key in unsafe:
+        if key in unsafe or key in skip or not may_cut:
             continue
         stream = _font_file(fonts[0])
         try:
@@ -312,7 +333,62 @@ def subset_fonts(pdf: pikepdf.Pdf) -> tuple[set[int], int]:
             continue
         stream.write(packed, filter=Name.FlateDecode)
         stream.Length1 = len(cut)
-        count += 1
+        changes.cut += 1
+        changes.programs[key] = _shown(usage, fonts)
+    if convert:
+        _convert_type1(pdf, usage, skip, changes)
+    return changes
+
+
+def _has_fields(pdf: pikepdf.Pdf) -> bool:
+    """An interactive form with fields (hyperref adds an empty one)."""
+    form = pdf.Root.get("/AcroForm")
+    if form is None:
+        return False
+    fields = form.get("/Fields") if isinstance(form, pikepdf.Dictionary) else None
+    return not isinstance(fields, pikepdf.Array) or len(fields) > 0
+
+
+def _shown(usage: _Usage, fonts: list) -> set[int]:
+    return {page for font in fonts for page in usage.pages.get(font.objgen, set())}
+
+
+def _convert_type1(pdf: pikepdf.Pdf, usage: _Usage, skip: frozenset,
+                   changes: FontChanges) -> None:
+    """Repack embedded Type 1 programs as CFF (``/FontFile3``, ``/Type1C``).
+
+    A program is converted only when every font dictionary that uses it was
+    found in the walked resources, so all the pages that show it are known.
+    """
+    users: dict[tuple, list] = defaultdict(list)
+    unsafe: set[tuple] = set()
+    for font in [obj for obj in pdf.objects if isinstance(obj, pikepdf.Dictionary)
+                 and obj.get("/Subtype") in ("/Type1", "/MMType1")]:
+        stream = _font_file(font, "/FontFile")
+        if stream is None:
+            continue
+        if font.objgen in usage.known:
+            users[stream.objgen].append(font)
+        else:
+            unsafe.add(stream.objgen)
+    for key, fonts in users.items():
+        if key in unsafe or key in skip:
+            continue
+        stream = _font_file(fonts[0], "/FontFile")
+        try:
+            program = type1.to_cff(bytes(stream.read_bytes()))
+        except (type1.Unsupported, pikepdf.PdfError, ValueError):
+            continue
+        packed = zlib.compress(program, 9)
+        if len(packed) >= len(stream.read_raw_bytes()):
+            continue
+        replacement = pdf.make_stream(packed)
+        replacement.Filter = Name.FlateDecode
+        replacement.Subtype = Name.Type1C
         for font in fonts:
-            pages |= usage.pages.get(font.objgen, set())
-    return pages, count
+            descriptor = _descriptor(font)
+            if "/FontFile" in descriptor:
+                del descriptor["/FontFile"]
+            descriptor.FontFile3 = replacement
+        changes.converted += 1
+        changes.programs[key] = _shown(usage, fonts)

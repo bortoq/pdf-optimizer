@@ -1,6 +1,7 @@
 """Regression tests for defects found in the audit: damaged files, PDF/A-1,
 interrupted runs, output files, the no-gain cache and the quality marker."""
 
+import contextlib
 import os
 from pathlib import Path
 import signal
@@ -229,7 +230,9 @@ class DurabilityTests(unittest.TestCase):
             real_fsync(handle)
 
         def replace(source, target):
-            events.append("replace")
+            # Work files inside the scratch folder are renamed too; only the
+            # rename onto the source matters here.
+            events.append("replace source" if Path(target) == book else "replace")
             real_replace(source, target)
 
         with tempfile.TemporaryDirectory() as root:
@@ -238,7 +241,8 @@ class DurabilityTests(unittest.TestCase):
             with patch("pdfopt.optimize.os.fsync", fsync), \
                     patch("pdfopt.optimize.os.replace", replace):
                 self.assertIn("compressed", optimize_pdf(book, jobs=2)[0])
-        self.assertEqual(events[:2], ["fsync", "replace"])
+        at = events.index("replace source")
+        self.assertEqual(events[at - 1:at + 2], ["fsync", "replace source", "fsync"])
 
 
 @unittest.skipIf(sys.platform == "win32", "POSIX signals")
@@ -253,10 +257,12 @@ class TerminationTests(unittest.TestCase):
             for index in range(3):
                 make_scan_pdf(books / f"scan{index}.pdf", pages=6)
             sizes = {book.name: book.stat().st_size for book in books.iterdir()}
+            # A crash or a hang prints the Python stack of every thread.
             process = subprocess.Popen(
                 [sys.executable, "-m", "pdfopt", "-q", "90", *options, str(books)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                cwd=Path(__file__).parent.parent)
+                cwd=Path(__file__).parent.parent, start_new_session=True,
+                env={**os.environ, "PYTHONFAULTHANDLER": "1"})
             # Stop it in the middle of a file: as soon as a work folder is there.
             deadline = time.monotonic() + 60
             while not any(p.name.startswith(".pdfopt-") for p in Path(root).rglob(".pdfopt-*")):
@@ -268,8 +274,13 @@ class TerminationTests(unittest.TestCase):
             try:
                 _, err = process.communicate(timeout=60)
             except subprocess.TimeoutExpired:
-                process.kill()
-                self.fail("the run did not stop after SIGTERM")
+                process.send_signal(signal.SIGABRT)     # dumps the stacks
+                try:
+                    _, err = process.communicate(timeout=10)
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                self.fail(f"the run did not stop after SIGTERM:\n{err}")
             left = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*")
                           if p.name.startswith(".pdfopt-"))
             # Not one file was finished, so every source is as it was.
@@ -279,12 +290,12 @@ class TerminationTests(unittest.TestCase):
 
     def test_a_single_process_cleans_up(self):
         code, err, left = self.terminate("-j", "1")
-        self.assertEqual((code, left), (130, []))
+        self.assertEqual((code, left), (130, []), err)
         self.assertIn("interrupted", err)
 
     def test_worker_processes_are_told_and_clean_up(self):
         code, err, left = self.terminate("-j", "3", output=True)
-        self.assertEqual((code, left), (130, []))
+        self.assertEqual((code, left), (130, []), err)
         self.assertIn("interrupted", err)
 
 

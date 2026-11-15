@@ -32,7 +32,7 @@ def cut(path: Path) -> tuple[set[int], int]:
     with pikepdf.open(path, allow_overwriting_input=True) as pdf:
         result = fonts.subset_fonts(pdf)
         pdf.save(path)
-    return result
+    return result.pages, result.cut
 
 
 class SubsetTests(unittest.TestCase):
@@ -87,6 +87,12 @@ class SubsetTests(unittest.TestCase):
                 make_font_pdf(path, **options)
                 self.assertEqual(cut(path), (set(), 0))
                 self.assertEqual(len(outlines(program(path))), 201)
+
+    def test_an_empty_form_does_not_stop_the_cut(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "f.pdf"
+            make_font_pdf(path, acroform="empty")
+            self.assertEqual(cut(path)[1], 1)
 
     def test_unparsable_content_disables_cutting(self):
         with tempfile.TemporaryDirectory() as root:
