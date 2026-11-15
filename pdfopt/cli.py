@@ -209,7 +209,7 @@ def _signals_held():
     set its own handler (``_init_worker`` releases them). A request that
     comes meanwhile is delivered to this process when the block ends.
     """
-    if not hasattr(signal, "pthread_sigmask"):     # Windows
+    if sys.platform == "win32":     # no signal masks
         yield
         return
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
@@ -227,7 +227,7 @@ def _init_worker(channel, known: set[str]) -> None:
     # workers just stop. Programs started by a worker get the default action.
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-    if hasattr(signal, "pthread_sigmask"):
+    if sys.platform != "win32":
         signal.pthread_sigmask(signal.SIG_UNBLOCK, _STOP_SIGNALS)
 
 
